@@ -1,5 +1,6 @@
 streamlit
+yfinance>=0.2.37
 google-generativeai
-yfinance
+requests
 Pillow
 pandas
