@@ -1,5 +1,6 @@
 import streamlit as st
 import yfinance as yf
+import pandas as pd
 import urllib.request
 import xml.etree.ElementTree as ET
 import google.generativeai as genai
@@ -31,39 +32,38 @@ if "strategy_result" not in st.session_state:
 if "target_prices" not in st.session_state:
     st.session_state.target_prices = None
 
-# --- 1. 共通関数群 ---
-
-def get_yf_session():
-    """Yahooファイナンスのブロックを回避するためのブラウザ偽装セッション"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    })
-    return session
+# --- 1. 共通関数群（超・安定版） ---
 
 def get_fx_data(ticker):
-    """現在価格と前日比を取得する関数（ブロック回避版）"""
+    """現在価格と前日比を取得する関数（安定のdownload方式）"""
     try:
-        session = get_yf_session()
-        data = yf.Ticker(ticker, session=session).history(period="2d", interval="1d")
-        if len(data) >= 2:
-            prev_close = float(data['Close'].iloc[-2])
-            current = float(data['Close'].iloc[-1])
+        # Tickerではなくエラーの少ないdownloadを使用
+        data = yf.download(ticker, period="5d", interval="1d", progress=False)
+        if data is not None and not data.empty and len(data) >= 2:
+            # yfinanceのバージョン違いによるエラーを吸収
+            close_data = data['Close']
+            if isinstance(close_data, pd.DataFrame):
+                close_data = close_data.iloc[:, 0]
+                
+            prev_close = float(close_data.iloc[-2])
+            current = float(close_data.iloc[-1])
             diff = current - prev_close
             return current, diff
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"価格データ取得エラー({ticker}): {e}")
     return 0, 0
 
 def get_current_price(ticker):
-    """監視用の最新価格を1分足で取得（ブロック回避版）"""
+    """監視用の最新価格を1分足で取得（安定のdownload方式）"""
     try:
-        session = get_yf_session()
-        data = yf.Ticker(ticker, session=session).history(period="1d", interval="1m")
-        if not data.empty:
-            return float(data['Close'].iloc[-1])
-    except Exception:
-        pass
+        data = yf.download(ticker, period="1d", interval="1m", progress=False)
+        if data is not None and not data.empty:
+            close_data = data['Close']
+            if isinstance(close_data, pd.DataFrame):
+                close_data = close_data.iloc[:, 0]
+            return float(close_data.iloc[-1])
+    except Exception as e:
+        st.sidebar.error(f"監視用データ取得エラー: {e}")
     return 0
 
 def get_auto_news():
