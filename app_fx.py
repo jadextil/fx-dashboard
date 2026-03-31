@@ -1,109 +1,127 @@
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
+import urllib.request
+import xml.etree.ElementTree as ET
 import google.generativeai as genai
-from datetime import datetime, timedelta
+from datetime import datetime
+from PIL import Image
 
 # --- 0. 初期設定 ---
+# ページの名前とレイアウト設定
 st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室", layout="wide")
 
+# APIキーの読み込み
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
-except:
-    st.error("APIキーの設定を確認してください。")
+except Exception as e:
+    st.error("APIキーが設定されていません。secrets.toml を確認してください。")
     st.stop()
 
-# --- 1. バックテスト用ロジック ---
-def run_backtest(ticker, initial_capital=1000000):
-    # 過去1ヶ月の1時間足を取得
-    df = yf.download(ticker, period="1mo", interval="1h")
+# --- セッション状態の初期化 ---
+# 画面が再読み込みされてもAIの回答が消えないようにする仕組み
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = ""
+if "technical_result" not in st.session_state:
+    st.session_state.technical_result = ""
+if "strategy_result" not in st.session_state:
+    st.session_state.strategy_result = ""
+
+# --- 1. 共通関数群 ---
+def get_fx_data(ticker):
+    """現在価格と前日比を取得する関数"""
+    data = yf.Ticker(ticker).history(period="2d", interval="1d")
+    if len(data) >= 2:
+        prev_close = float(data['Close'].iloc[-2])
+        current = float(data['Close'].iloc[-1])
+        diff = current - prev_close
+        return current, diff
+    return 0, 0
+
+def get_auto_news():
+    """Yahooニュースから経済・国際ニュースを20本自動取得する関数"""
+    urls = [
+        "https://news.yahoo.co.jp/rss/categories/business.xml",
+        "https://news.yahoo.co.jp/rss/categories/world.xml"
+    ]
+    news_list = []
+    try:
+        for url in urls:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                xml_data = response.read()
+            root = ET.fromstring(xml_data)
+            for item in root.findall('./channel/item')[:10]:
+                news_list.append("・" + item.find('title').text)
+        return "\n".join(news_list)
+    except Exception as e:
+        return f"ニュース取得エラー: {e}"
+
+# ==========================================
+# メイン画面構成（リアルタイム分析）
+# ==========================================
+st.title("🎯 リアルタイム AI相場解析")
+st.caption(f"最終更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+col1, col2, col3 = st.columns([1.2, 2, 2])
+
+# --- 左側：データ表示 ---
+with col1:
+    st.subheader("📊 現在の価格")
+    usd_price, usd_diff = get_fx_data("JPY=X")
+    st.metric(label="🇺🇸 ドル/円 (USD/JPY)", value=f"{usd_price:.3f} 円", delta=f"{usd_diff:.3f} 円")
     
-    # 簡易的な戦略（例：RSIが30以下で買い、70以上で売り）
-    # RSI計算
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    eur_price, eur_diff = get_fx_data("EURUSD=X")
+    st.metric(label="🇪🇺 ユーロ/ドル (EUR/USD)", value=f"{eur_price:.5f} ドル", delta=f"{eur_diff:.5f} ドル")
     
-    # シミュレーション変数
-    balance = initial_capital
-    position = 0
-    history = [initial_capital]
-    trades = [] # 負けたトレードの記録用
+    gbp_price, gbp_diff = get_fx_data("GBPJPY=X")
+    st.metric(label="🇬🇧 ポンド/円 (GBP/JPY)", value=f"{gbp_price:.3f} 円", delta=f"{gbp_diff:.3f} 円")
 
-    for i in range(1, len(df)):
-        price = df['Close'].iloc[i]
-        rsi = df['RSI'].iloc[i]
-        
-        # 買いシグナル (RSI < 30) かつ ポジションなし
-        if rsi < 30 and position == 0:
-            position = balance / price
-            entry_price = price
-            entry_time = df.index[i]
-        
-        # 売りシグナル (RSI > 70) かつ ポジションあり
-        elif rsi > 70 and position > 0:
-            balance = position * price
-            p_l = balance - initial_capital # 簡易的なP/L
-            if price < entry_price: # 負けトレード
-                trades.append(f"時刻: {entry_time}, 買値: {entry_price:.2f}, 売値: {price:.2f}")
-            position = 0
-        
-        history.append(balance if position == 0 else position * price)
-
-    return df.index, history, trades
-
-# --- メイン画面 ---
-tab1, tab2 = st.tabs(["🚀 リアルタイム分析", "📊 過去データ検証（バックテスト）"])
-
-with tab1:
-    st.write("（※ここには以前のリアルタイム分析・チャート解析コードが入ります）")
-    st.info("リアルタイム分析画面はこれまでのコードをご使用ください。")
-
-with tab2:
-    st.header("📈 戦略のシミュレーション")
-    st.write("「もし100万円でAI戦略を運用していたら？」を検証します。")
+# --- 中央：情報収集 ＆ 解析トリガー ---
+with col2:
+    st.subheader("📰 情報収集 ＆ チャート入力")
     
-    target_pair = st.selectbox("検証する通貨ペア", ["JPY=X", "EURUSD=X"], index=0)
+    # ニュース自動表示
+    latest_news = get_auto_news()
+    st.text_area("自動取得した最新ニュース（計20本）", value=latest_news, height=150)
     
-    if st.button("バックテストを開始する", type="primary"):
-        with st.spinner("過去1ヶ月のデータを解析中..."):
-            dates, equity_curve, bad_trades = run_backtest(target_pair)
+    # 画像アップロード
+    st.write("📸 チャート画像解析（任意）")
+    uploaded_file = st.file_uploader("DMM FXなどのスクショを添付", type=["png", "jpg", "jpeg"])
+    if uploaded_file:
+        st.image(uploaded_file, use_container_width=True)
+    
+    # 解析ボタン
+    if st.button("✨ 総合解析を実行", use_container_width=True, type="primary"):
+        with st.spinner("AIが徹底解析中..."):
             
-            # 資産曲線の表示
-            final_balance = equity_curve[-1]
-            profit = final_balance - 1000000
+            # 1. ファンダメンタルズ解析
+            prompt_analysis = f"プロトレーダーとして以下の20本のニュースから相場環境（円安か円高か、重要トピック）を解説して。\n{latest_news}"
+            st.session_state.analysis_result = model.generate_content(prompt_analysis).text
             
-            col_a, col_b = st.columns(2)
-            col_a.metric("最終資産", f"{final_balance:,.0f} 円", f"{profit:,.0f} 円")
-            
-            # グラフ表示
-            st.line_chart(pd.DataFrame(equity_curve, index=dates, columns=["総資産"]))
-            
-            st.write("---")
-            st.subheader("🤖 AIによる『負けトレード』の反省会")
-            
-            if bad_trades:
-                # 負けたトレードの情報をAIに渡す
-                lose_data = "\n".join(bad_trades[:3]) # 直近3つ
-                reflection_prompt = f"""
-                あなたは凄腕のFXトレーダーです。以下の「負けたトレード（損切り）」のデータを見て、
-                なぜこのタイミングでの買いが失敗したのか、市場の背景を推測して反省文を作成してください。
-                
-                【負けたデータ】
-                {lose_data}
-                
-                【指示】
-                ・負けた理由の仮説を立ててください。
-                ・次から同じ負けを繰り返さないための「新しいルール（例：〇〇の時はエントリーしない）」を提案してください。
-                ・釘田様を励ます前向きな言葉で締めてください。
-                """
-                
-                response = model.generate_content(reflection_prompt)
-                st.warning(response.text)
+            # 2. テクニカル解析
+            if uploaded_file:
+                img = Image.open(uploaded_file)
+                prompt_technical = "このFXチャートのトレンド、サポート/レジスタンス、特徴的なパターンを簡潔に指摘して。"
+                st.session_state.technical_result = model.generate_content([prompt_technical, img]).text
             else:
-                st.success("この期間、大きな負けトレードはありませんでした！素晴らしい戦略です。")
+                st.session_state.technical_result = "チャート画像がアップロードされていません。"
+            
+            # 3. 戦略構築
+            prompt_strategy = f"現在のドル円は{usd_price:.3f}円。ニュースを踏まえ、今日のデイトレ戦略（方向性、購入目安、利確・損切りライン、根拠）を提案して。"
+            st.session_state.strategy_result = model.generate_content(prompt_strategy).text
+
+# --- 右側：AIの解析結果と戦略 ---
+with col3:
+    st.subheader("💡 今日のトレード指令")
+    
+    if st.session_state.strategy_result:
+        st.success("🎯 【結論】戦略\n\n" + st.session_state.strategy_result)
+        
+        if uploaded_file:
+            st.warning("📈 【テクニカル】\n\n" + st.session_state.technical_result)
+            
+        st.info("📰 【ファンダメンタルズ】\n\n" + st.session_state.analysis_result)
+    else:
+        st.write("「総合解析を実行」ボタンを押すと、AIが算出した【戦略】【チャート分析】【環境認識】がここに表示されます。")
