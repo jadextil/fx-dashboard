@@ -1,4 +1,7 @@
 {
-  "target_price": 150.00,
-  "is_active": false
+  "entry": 150.1,
+  "tp": 150.5,
+  "sl": 149.8,
+  "status": "waiting_entry",
+  "is_active": true
 }
