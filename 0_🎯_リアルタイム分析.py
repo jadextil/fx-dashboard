@@ -32,19 +32,38 @@ if "target_prices" not in st.session_state:
     st.session_state.target_prices = None
 
 # --- 1. 共通関数群 ---
+
+def get_yf_session():
+    """Yahooファイナンスのブロックを回避するためのブラウザ偽装セッション"""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    })
+    return session
+
 def get_fx_data(ticker):
-    data = yf.Ticker(ticker).history(period="2d", interval="1d")
-    if len(data) >= 2:
-        prev_close = float(data['Close'].iloc[-2])
-        current = float(data['Close'].iloc[-1])
-        diff = current - prev_close
-        return current, diff
+    """現在価格と前日比を取得する関数（ブロック回避版）"""
+    try:
+        session = get_yf_session()
+        data = yf.Ticker(ticker, session=session).history(period="2d", interval="1d")
+        if len(data) >= 2:
+            prev_close = float(data['Close'].iloc[-2])
+            current = float(data['Close'].iloc[-1])
+            diff = current - prev_close
+            return current, diff
+    except Exception:
+        pass
     return 0, 0
 
 def get_current_price(ticker):
-    data = yf.Ticker(ticker).history(period="1d", interval="1m")
-    if not data.empty:
-        return float(data['Close'].iloc[-1])
+    """監視用の最新価格を1分足で取得（ブロック回避版）"""
+    try:
+        session = get_yf_session()
+        data = yf.Ticker(ticker, session=session).history(period="1d", interval="1m")
+        if not data.empty:
+            return float(data['Close'].iloc[-1])
+    except Exception:
+        pass
     return 0
 
 def get_auto_news():
@@ -84,7 +103,6 @@ def update_github_config(entry, tp, sl):
         res = requests.get(url, headers=headers).json()
         sha = res["sha"]
         
-        # 🌟 ポイント：status（状態）を"waiting_entry"として書き込む
         content_dict = {
             "entry": entry, "tp": tp, "sl": sl, 
             "status": "waiting_entry", "is_active": True
@@ -175,7 +193,7 @@ with col3:
                         break
                     time.sleep(interval * 60)
                 
-                # フェーズ2：利確・損切り監視（ブラウザを閉じていなければそのまま動く）
+                # フェーズ2：利確・損切り監視
                 if entry_reached:
                     st.warning("フェーズ2：利確・損切りを監視中...")
                     while True:
