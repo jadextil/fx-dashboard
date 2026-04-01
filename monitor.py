@@ -45,12 +45,13 @@ def check_price():
     if not config.get("is_active"):
         return # 監視がオフなら終了
 
-    # 🌟 「売り(sell)」「買い(buy)」の方向を取得（古い設定ファイル対策でデフォルトはbuy）
+    # 🌟 「売り(sell)」「買い(buy)」の方向と「ロット数」を取得
     side = config.get("side", "buy")
     status = config.get("status", "waiting_entry")
     entry = config["entry"]
     tp = config["tp"]
     sl = config["sl"]
+    lots = config.get("lots", 0.0) # ロット数を追加（古い設定用に対策済み）
 
     # 2. 現在価格を取得（エラーが起きにくい download方式）
     try:
@@ -70,7 +71,8 @@ def check_price():
     # 3. 状態(フェーズ)に応じた監視ロジック
     if status == "waiting_entry":
         if abs(current_p - entry) <= 0.03:
-            send_discord(f"🔔 【クラウド・エントリー到達】\n方向: {side} / 設定: {entry}円\n現在: {current_p:.3f}円\n自動で利確・損切りの監視に移行します。")
+            # 🌟 通知にDMM FX用のロット数を追加！
+            send_discord(f"🔔 【クラウド・エントリー到達】\n方向: {side}\n推奨ロット: {lots} ロット\n設定: {entry}円\n現在: {current_p:.3f}円\n※DMM FXで注文を実行してください。自動で決済監視に移行します。")
             config["status"] = "holding" # 状態を「保有中」に変更
             update_config_status(config, sha)
 
