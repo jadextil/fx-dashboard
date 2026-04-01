@@ -36,17 +36,29 @@ if "target_prices" not in st.session_state:
 
 def get_market_session():
     """現在の時刻から、東京・ロンドン・NYのどのセッションかを判定する。"""
+    # 日本時間を基準にする
     jst = pytz.timezone('Asia/Tokyo')
     now = datetime.now(jst).time()
+    
     sessions = []
-    if time(9, 0) <= now <= time(15, 0): sessions.append("東京市場 (Tokyo)")
-    if time(16, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(1, 0): sessions.append("ロンドン市場 (London)")
-    if time(21, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(6, 0): sessions.append("ニューヨーク市場 (NY)")
-    if not sessions: sessions.append("オセアニア/時間外 (Quiet Time)")
+    # 東京市場: 09:00 - 15:00
+    if time(9, 0) <= now <= time(15, 0):
+        sessions.append("東京市場 (Tokyo)")
+    
+    # ロンドン市場: 16:00 - 翌01:00 (修正済み)
+    if now >= time(16, 0) or now <= time(1, 0):
+        sessions.append("ロンドン市場 (London)")
+    
+    # ニューヨーク市場: 21:00 - 翌06:00 (修正済み)
+    if now >= time(21, 0) or now <= time(6, 0):
+        sessions.append("ニューヨーク市場 (NY)")
+    
+    if not sessions:
+        sessions.append("オセアニア/時間外 (Quiet Time)")
     return " & ".join(sessions)
 
 def get_market_indicators():
-    """マクロ指標（TNX, VIX, DXY）および相関資産（N225, SPX）を正確に取得。"""
+    """マクロ指標（TNX, VIX, DXY）および相関資産（N225, SPX）を取得。"""
     results = {}
     targets = {"TNX": "^TNX", "VIX": "^VIX", "N225": "^N225", "SPX": "^GSPC"}
     
@@ -91,7 +103,7 @@ def get_technical_chart_data(ticker="JPY=X"):
         data['Upper2'] = data['SMA20'] + (std * 2)
         data['Lower2'] = data['SMA20'] - (std * 2)
         
-        # 🌟 RSI(14) の計算（復活・明示）
+        # RSI(14) の計算
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(window=14).mean()
         loss = -delta.clip(upper=0).rolling(window=14).mean()
@@ -119,7 +131,7 @@ def get_technical_chart_data(ticker="JPY=X"):
             "sma50": float(latest['SMA50']),
             "upper2": float(latest['Upper2']),
             "lower2": float(latest['Lower2']),
-            "rsi14": float(latest['RSI14']), # 🌟 RSIを辞書に格納
+            "rsi14": float(latest['RSI14']),
             "bb_width": float(current_width),
             "bb_avg_width": float(avg_width),
             "is_squeeze": is_squeeze,
@@ -225,7 +237,6 @@ with col2:
         fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
-        # 🌟 RSIを含むテクニカル情報の可視化
         status_sq = "⚠️ スクイーズ中" if tech['is_squeeze'] else "🚀 ボラ拡大中"
         st.caption(f"💡 {status_sq} | BB幅: {tech['bb_width']:.4f} | RSI(14): {tech['rsi14']:.1f}")
         st.caption(f"💡 5日高値: {tech['high_5d']:.2f} | 5日安値: {tech['low_5d']:.2f} | 日足SMA20: {tech['daily_sma20']:.2f}")
@@ -239,7 +250,6 @@ with col2:
     if st.button("✨ 総合解析を実行 (全データ注入)", use_container_width=True, type="primary"):
         with st.spinner("AIが全指標を精密分析中..."):
             current_session = get_market_session()
-            # 🌟 RSIを含む全コンテキストをAIに注入
             ai_context = f"""
             【市場セッション】{current_session}
             【短期足(1H)】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI(14):{tech['rsi14']:.1f}
@@ -274,7 +284,6 @@ with col3:
 
             if st.button("🚀 24時間監視予約を実行", use_container_width=True, type="primary"):
                 if update_github_config(side, t_ent, t_tp, t_sl, lots, "Rule 1"):
-                    # GASとDiscordへ通知
                     requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%Y-%m-%d %H:%M'), "rule": "1", "side": "買い" if side == "buy" else "売り", "entry": t_ent, "exit": 0, "result": "待機中", "pnl": 0, "lots": lots})
                     requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\nセッション: {get_market_session()}\nRSI: {tech['rsi14']:.1f}\n方向: {side} / ロット: {lots}\nEntry: {t_ent}円 / TP: {t_tp}円 / SL: {t_sl}"})
                     st.success("Rule 1 予約完了！")
