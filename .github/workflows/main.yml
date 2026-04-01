@@ -1,25 +1,34 @@
 name: FX Price Monitor
+
 on:
   schedule:
-    - cron: '*/5 * * * *' # 🌟 5分おきに自動実行
-  workflow_dispatch: # 手動実行ボタンも維持
+    - cron: '*/5 * * * *' # 5分おきに実行
+  workflow_dispatch: # 🌟 手動で今すぐ動かすためのボタンを追加
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 🌟 GitHub Actionsがリポジトリのファイルを書き換える許可を与える
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
       - name: Install dependencies
-        run: pip install yfinance requests pandas
+        run: |
+          pip install yfinance requests pandas
+
       - name: Run Monitor
         env:
+          # 🌟 Secretsの名前が monitor.py の os.environ.get と一致しているか確認
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }} # 手順で作成した新しいトークン
           GITHUB_REPO: ${{ github.repository }}
           GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
         run: python monitor.py
