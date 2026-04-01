@@ -3,35 +3,48 @@ import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 
+# --- 0. 初期設定 ---
 st.set_page_config(page_title="釘田式・AI戦略分析室 PRO", layout="wide")
+
+MODEL_NAME = 'gemini-2.5-flash' 
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
-    # モデル名は安定版を指定
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel(MODEL_NAME)
 except Exception as e:
-    st.error("APIキーの設定を確認してください。")
+    st.error(f"API設定を確認してください: {e}")
     st.stop()
 
 if "saved_rule_text" not in st.session_state:
     st.session_state.saved_rule_text = ""
 
+# --- 1. インジケーター計算（BB追加） ---
 def add_indicators(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
     df = df.copy()
+    
+    # SMA & BB
     df['SMA20'] = df['Close'].rolling(window=20).mean()
+    df['StdDev'] = df['Close'].rolling(window=20).std()
+    df['Upper2'] = df['SMA20'] + (df['StdDev'] * 2)
+    df['Lower2'] = df['SMA20'] - (df['StdDev'] * 2)
+    
+    # RSI
     delta = df['Close'].diff()
     gain = delta.clip(lower=0).rolling(window=14).mean()
     loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
     rs = gain / loss
     df['RSI14'] = 100 - (100 / (1 + rs))
+    
+    # ATR
     df['ATR'] = (df['High'] - df['Low']).rolling(window=14).mean()
+    
     return df.dropna()
 
 def find_optimal_rule(ticker):
-    # 300時間をカバーするために期間を長めに取得
+    # 300時間を取得するために、1ヶ月分を取得
     df = yf.download(ticker, period="1mo", interval="1h", progress=False)
     df = add_indicators(df)
     
@@ -40,32 +53,29 @@ def find_optimal_rule(ticker):
     data_summary = ""
     for index, row in analysis_df.iterrows(): 
         data_summary += (f"{index.strftime('%m/%d %H:%M')} | "
-                         f"始:{row['Open']:.3f} 高:{row['High']:.3f} 安:{row['Low']:.3f} 終:{row['Close']:.3f} | "
-                         f"SMA20:{row['SMA20']:.3f} RSI:{row['RSI14']:.1f} ATR:{row['ATR']:.3f}\n")
+                         f"終:{row['Close']:.3f} BB上:{row['Upper2']:.3f} BB下:{row['Lower2']:.3f} "
+                         f"SMA:{row['SMA20']:.3f} RSI:{row['RSI14']:.1f} ATR:{row['ATR']:.3f}\n")
 
     prompt = f"""
-    あなたは世界最高峰のクオンツ・トレーダーです。
-    {ticker}の直近300時間分のデータを分析し、「再現性が高く」「期待値がプラス」になるデイトレ・ルールを1つだけ考案してください。
+    あなたは世界最高峰のクオンツです。{ticker}の直近300時間のデータを元に、ボリンジャーバンド(BB)を活用した勝てる戦略を1つ立案してください。
 
-    【分析用データ】
+    【分析用データ（直近300時間）】
     {data_summary}
 
-    【戦略構築の指針（重要）】
-    1. **過学習の回避**: この300時間だけに通用するルールではなく、相場の原理原則（押し目買い、戻り売り、ボラティリティの収束と拡散など）に基づいたルールにしてください。
-    2. **数値の明確化**: 「RSIが低い時」ではなく「RSIが30以下の時」のように、バックテストで100%機械的に判定できる数値基準を設けてください。
-    3. **損益比の意識**: 利確と損切りの幅を、ATRの何倍にするかなどの論理的な出口戦略を含めてください。
-    4. **フィルタリング**: トレードすべきでない「レンジ相場」や「低ボラティリティ」を排除する条件を加えてください。
-
+    【戦略立案の最優先事項（結果を出すための指示）】
+    1. **ボラティリティの選別**: BBがスクイーズ（狭まっている）している停滞期を避け、エクスパンション（広がり）が始まったタイミングを狙うなど、無駄なエントリーを削る条件を入れてください。
+    2. **優位性の根拠**: なぜその条件で勝てると判断したのか、300時間のデータ傾向から説明してください。
+    3. **出口の厳格化**: 利確・損切りをBBの±2σやATRの何倍にするか等、ボラティリティに基づいた設定にしてください。
+    
     【出力項目】
     - 戦略名
-    - 環境認識（現在の相場の特徴）
-    - エントリー条件（ロング/ショートそれぞれ）
+    - エントリー条件（数値で具体的に）
     - 決済条件（利確・損切り）
+    - この300時間で特に機能すると判断した理由
     """
     
     try:
-        safety_settings = [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}]
-        response = model.generate_content(prompt, safety_settings=safety_settings)
+        response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"⚠️ エラーが発生しました: {str(e)}"
@@ -73,8 +83,8 @@ def find_optimal_rule(ticker):
 st.title("🧠 釘田式・AI戦略分析室 PRO")
 target_pair = st.selectbox("分析対象", ["JPY=X", "EURUSD=X", "GBPJPY=X"])
 
-if st.button("🚀 300時間のデータから最適ルールを逆算する", type="primary", use_container_width=True):
-    with st.spinner("300時間のローソク足とテクニカル指標を精密分析中..."):
+if st.button("🚀 300時間のデータとBBから最適ルールを逆算", type="primary", use_container_width=True):
+    with st.spinner("300時間のローソク足とBBを精密分析中..."):
         result = find_optimal_rule(target_pair)
         st.session_state.temp_result = result
 
@@ -83,4 +93,4 @@ if "temp_result" in st.session_state:
     st.markdown(st.session_state.temp_result)
     if st.button("📥 このルールをバックテストに適用", use_container_width=True):
         st.session_state.saved_rule_text = st.session_state.temp_result
-        st.toast("バックテスト側にルールを保存しました。")
+        st.toast("保存完了！バックテストページへ")
