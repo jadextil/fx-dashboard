@@ -1,9 +1,9 @@
 {
-  "side": "buy",
-  "entry": 158.68600463867188,
-  "tp": 158.76,
-  "sl": 158.35,
-  "lots": 2.98,
+  "side": "sell",
+  "entry": 158.35,
+  "tp": 157.95,
+  "sl": 158.5,
+  "lots": 6.67,
   "status": "waiting_entry",
   "is_active": true
 }
