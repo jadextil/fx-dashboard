@@ -1,10 +1,10 @@
 {
   "rule_name": "Rule 1",
-  "side": "buy",
-  "entry": 158.32,
-  "tp": 158.88,
-  "sl": 158.19,
-  "lots": 7.69,
+  "side": "sell",
+  "entry": 158.9,
+  "tp": 158.5,
+  "sl": 159.05,
+  "lots": 6.67,
   "status": "waiting_entry",
   "is_active": true
 }
