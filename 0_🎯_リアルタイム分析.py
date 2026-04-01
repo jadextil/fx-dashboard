@@ -34,7 +34,7 @@ if "target_prices" not in st.session_state:
 # --- 1. 共通関数群 ---
 
 def get_market_indicators():
-    """ウォール街が重視する3大指標（TNX, VIX, DXY）を取得。"""
+    """ウォール街が重視する3大指標（TNX, VIX, DXY）に加え、相関資産（日経平均, S&P500）を取得。"""
     results = {}
     # 米10年債利回り
     try:
@@ -53,6 +53,24 @@ def get_market_indicators():
             results["VIX"] = {"val": c, "diff": c - p}
         else: results["VIX"] = {"val": 0.0, "diff": 0.0}
     except: results["VIX"] = {"val": 0.0, "diff": 0.0}
+
+    # 🌟 相関資産：日経平均株価 (N225)
+    try:
+        data = yf.Ticker("^N225").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["N225"] = {"val": c, "diff": c - p}
+        else: results["N225"] = {"val": 0.0, "diff": 0.0}
+    except: results["N225"] = {"val": 0.0, "diff": 0.0}
+
+    # 🌟 相関資産：S&P500指数 (SPX)
+    try:
+        data = yf.Ticker("^GSPC").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["SPX"] = {"val": c, "diff": c - p}
+        else: results["SPX"] = {"val": 0.0, "diff": 0.0}
+    except: results["SPX"] = {"val": 0.0, "diff": 0.0}
     
     # ドル指数 (DXY) - 複数のティッカーで安定取得を試行
     dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
@@ -61,16 +79,19 @@ def get_market_indicators():
         try:
             data = yf.Ticker(t).history(period="5d")
             if not data.empty and len(data) >= 2:
-                c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
-                if t == "UUP": c *= 3.5; p *= 3.5 # UUPはETFのため補正
-                results["DXY"] = {"val": c, "diff": c - p}
+                c = float(data['Close'].iloc[-1]), float(data['Close'].iloc[-2])
+                if t == "UUP": 
+                    # UUPは価格帯が異なるため、リスト内包表記で補正
+                    c = [val * 3.5 for val in c]
+                results["DXY"] = {"val": c[0], "diff": c[0] - c[1]}
                 break
         except: continue
     return results
 
 def get_technical_chart_data(ticker="JPY=X"):
-    """1時間足のデータを取得し、テクニカル指標（BB含む）を自動計算する"""
+    """1時間足のデータを取得し、テクニカル指標（BB含む）を自動計算。さらに日足トレンドとレジサポを算出。"""
     try:
+        # 短期分析用（1時間足）
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
         
@@ -94,6 +115,18 @@ def get_technical_chart_data(ticker="JPY=X"):
         loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
         rs = gain / loss
         data['RSI14'] = 100 - (100 / (1 + rs))
+
+        # 🌟 上位足分析：日足データの取得
+        data_daily = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if isinstance(data_daily.columns, pd.MultiIndex):
+            data_daily.columns = [col[0] for col in data_daily.columns]
+        
+        # 日足SMA20（長期トレンドの方向性）
+        daily_sma20 = data_daily['Close'].rolling(window=20).mean().iloc[-1]
+        
+        # 🌟 直近5日間の最高値・最安値（重要レジサポ価格）
+        high_5d = float(data['High'].tail(120).max()) # 24時間×5日=120本
+        low_5d = float(data['Low'].tail(120).min())
         
         latest = data.iloc[-1]
         latest_tech = {
@@ -102,7 +135,10 @@ def get_technical_chart_data(ticker="JPY=X"):
             "sma50": float(latest['SMA50']),
             "upper2": float(latest['Upper2']),
             "lower2": float(latest['Lower2']),
-            "rsi14": float(latest['RSI14'])
+            "rsi14": float(latest['RSI14']),
+            "daily_sma20": float(daily_sma20), # 日足SMA
+            "high_5d": high_5d,               # 5日高値
+            "low_5d": low_5d                  # 5日安値
         }
         return data, latest_tech
     except Exception as e:
@@ -209,7 +245,7 @@ col1, col2, col3 = st.columns([1.2, 2.2, 1.8])
 
 # --- 左カラム：市場データ ＆ マクロ指標 ---
 with col1:
-    st.subheader("📊 為替 ＆ マクロ指標")
+    st.subheader("📊 為替 ＆ 多角分析指標")
     
     chart_data, tech_vals = get_technical_chart_data("JPY=X")
     usd_p = tech_vals.get("current", 0.0)
@@ -222,6 +258,12 @@ with col1:
     st.metric("📈 米10年債利回り (TNX)", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
     st.metric("📉 恐怖指数 (VIX)", f"{m_data['VIX']['val']:.2f}", f"{m_data['VIX']['diff']:.2f}")
     st.metric("💵 ドル指数 (DXY)", f"{m_data['DXY']['val']:.2f}", f"{m_data['DXY']['diff']:.2f}")
+    
+    # 🌟 追加：相関資産の表示
+    st.write("---")
+    st.write("💹 **グローバル相関資産**")
+    st.metric("🇯🇵 日経平均株価", f"{m_data['N225']['val']:,.0f} 円", f"{m_data['N225']['diff']:,.0f}")
+    st.metric("🇺🇸 S&P500指数", f"{m_data['SPX']['val']:,.2f}", f"{m_data['SPX']['diff']:.2f}")
     
     st.write("---")
     st.subheader("📅 重要経済指標予定")
@@ -250,7 +292,9 @@ with col2:
         
         fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"💡 RSI(14): {tech_vals.get('rsi14', 0):.1f} | BB上: {tech_vals.get('upper2', 0):.2f} | BB下: {tech_vals.get('lower2', 0):.2f}")
+        
+        # 🌟 現在のテクニカル数値を表示（レジサポと日足トレンドを追加）
+        st.caption(f"💡 RSI(14): {tech_vals.get('rsi14', 0):.1f} | 5日高値: {tech_vals.get('high_5d'):.2f} | 5日安値: {tech_vals.get('low_5d'):.2f} | 日足SMA20: {tech_vals.get('daily_sma20'):.2f}")
     else:
         st.warning("チャートデータを取得できませんでした。")
 
@@ -264,6 +308,7 @@ with col2:
     if st.button("✨ 総合解析を実行（全データ注入）", use_container_width=True, type="primary"):
         with st.spinner("AIクオンツが市場データとニュースを分析中..."):
             
+            # 🌟 AIに渡すプロンプトに「相関資産」と「上位足トレンド」「レジサポ」を注入！
             ai_context = f"""
             【現在の市場データ（ドル円: {usd_p:.3f}円）】
             ▼ テクニカル指標 (1時間足)
@@ -271,14 +316,21 @@ with col2:
             ・BB上2σ: {tech_vals.get('upper2', 0):.3f}
             ・BB下2σ: {tech_vals.get('lower2', 0):.3f}
             ・SMA20: {tech_vals.get('sma20', 0):.3f}
+            ・直近5日間の最高値: {tech_vals.get('high_5d'):.3f}
+            ・直近5日間の最安値: {tech_vals.get('low_5d'):.3f}
 
-            ▼ マクロ指標データ
+            ▼ 上位足トレンド (日足)
+            ・日足SMA20: {tech_vals.get('daily_sma20'):.3f}
+
+            ▼ マクロ指標 ＆ 相関資産
             ・米国債10年利回り: {m_data['TNX']['val']:.2f}%
             ・恐怖指数(VIX): {m_data['VIX']['val']:.2f}
             ・ドルインデックス(DXY): {m_data['DXY']['val']:.2f}
+            ・日経平均株価: {m_data['N225']['val']:,.0f}円
+            ・S&P500指数: {m_data['SPX']['val']:,.0f}
             """
             
-            prompt = f"以下の【市場データ】と【ニュース30件】を総合的に判断し、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
+            prompt = f"以下の【市場データ】と【ニュース30件】を総合的に判断し、上位足のトレンドと相関資産（株価）の動きを考慮した、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
             
             response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
@@ -328,7 +380,6 @@ with col3:
                 # Rule 1 として保存
                 if update_github_config(side, t_entry, t_tp, t_sl, calc_lots, "Rule 1"):
                     
-                    # スプレッドシート送信用データ（ルール列を分離）
                     log_data = {
                         "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
                         "rule": "1",
