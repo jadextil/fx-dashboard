@@ -74,7 +74,6 @@ def get_technical_chart_data(ticker="JPY=X"):
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
         
-        # yfinanceのバージョンによるデータ構造(MultiIndex)の吸収
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = [col[0] for col in data.columns]
             
@@ -212,7 +211,6 @@ col1, col2, col3 = st.columns([1.2, 2.2, 1.8])
 with col1:
     st.subheader("📊 為替 ＆ マクロ指標")
     
-    # チャートデータとテクニカル数値の取得
     chart_data, tech_vals = get_technical_chart_data("JPY=X")
     usd_p = tech_vals.get("current", 0.0)
     
@@ -240,22 +238,18 @@ with col1:
 with col2:
     st.subheader("📈 テクニカルチャート (1時間足 + BB)")
     
-    # Plotlyを使ったローソク足チャートの描画
     if chart_data is not None:
         fig = go.Figure(data=[go.Candlestick(x=chart_data.index,
                         open=chart_data['Open'], high=chart_data['High'],
                         low=chart_data['Low'], close=chart_data['Close'],
                         name='ローソク足')])
         
-        # 指標の追加
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA20'], line=dict(color='orange', width=1.5), name='SMA20'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Upper2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB+2σ'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Lower2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB-2σ'))
         
         fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
-        
-        # 現在のテクニカル数値を表示
         st.caption(f"💡 RSI(14): {tech_vals.get('rsi14', 0):.1f} | BB上: {tech_vals.get('upper2', 0):.2f} | BB下: {tech_vals.get('lower2', 0):.2f}")
     else:
         st.warning("チャートデータを取得できませんでした。")
@@ -331,11 +325,14 @@ with col3:
             st.metric("💡 推奨ロット数", f"{calc_lots} ロット")
 
             if st.button("🚀 Rule 1 で監視予約を実行", use_container_width=True, type="primary"):
+                # Rule 1 として保存
                 if update_github_config(side, t_entry, t_tp, t_sl, calc_lots, "Rule 1"):
                     
+                    # スプレッドシート送信用データ（ルール列を分離）
                     log_data = {
-                        "date": datetime.now().strftime('%m/%d %H:%M'),
-                        "side": f"Rule 1({side})",
+                        "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        "rule": "1",
+                        "side": "買い" if side == "buy" else "売り",
                         "entry": t_entry,
                         "exit": 0,
                         "result": "待機中",
