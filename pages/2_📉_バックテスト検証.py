@@ -37,34 +37,56 @@ def update_github_config(side, entry, tp, sl, lots, rule_name="Rule 2"):
         return requests.put(url, headers=headers, json=payload).status_code == 200
     except: return False
 
-st.title("📉 バックテスト ＆ Rule 2 監視予約")
+st.title("📉 バックテスト検証 ＆ AI改善 (Rule 2)")
 
 if "saved_rule_text" in st.session_state:
     target_pair = st.selectbox("テストペア", ["JPY=X", "EURUSD=X", "GBPJPY=X"])
-    if st.button("🚀 精密バックテスト ＆ 改善実行", type="primary"):
-        # (バックテスト実行ロジックは以前のものを維持...)
-        st.session_state.improved_rule = "AIが提案した改善後のRule 2の内容..." 
-        st.success("改善ルール(Rule 2)が生成されました")
+    if st.button("🚀 精密バックテスト ＆ 改善実行", type="primary", use_container_width=True):
+        with st.spinner("AIが計算中..."):
+            df = yf.download(target_pair, period="1mo", interval="1h", progress=False)
+            df = add_indicators(df)
+            price_data = "\n".join([f"{idx.strftime('%m/%d %H:%M')},終:{row['Close']:.2f},BB上:{row['Upper2']:.2f},BB下:{row['Lower2']:.2f}" for idx, row in df.iterrows()])
+            res = model.generate_content(f"以下のルールをデータに適用しJSONリストで出力せよ。\nルール:\n{st.session_state.saved_rule_text}\nデータ:\n{price_data}").text
+            match = re.search(r'\[.*\]', res, re.DOTALL)
+            trades = json.loads(match.group()) if match else []
+            
+            if trades:
+                initial_balance, balance, win_count, history = 1000000, 1000000, 0, []
+                for t in trades:
+                    e, ex = float(t['entry_price']), float(t['exit_price'])
+                    pnl_rate = (ex - e)/e if t.get('side')=='buy' else (e - ex)/e
+                    profit_yen = int(balance * pnl_rate)
+                    balance += profit_yen
+                    win_loss = "✅ 勝ち" if profit_yen > 0 else "❌ 負け"
+                    if profit_yen > 0: win_count += 1
+                    history.append({"結果": win_loss, "損益(円)": f"{profit_yen:+,}円", "エントリー": e, "決済": ex, "時間": t.get('entry_time'), "理由": t.get('reason')})
+                
+                st.metric("最終資産", f"{int(balance):,} 円", f"{int(balance-initial_balance):+,} 円")
+                st.table(pd.DataFrame(history))
+                
+                # 改善提案
+                improve_res = model.generate_content(f"以下の結果から改善案を出し、新ルールを <NEW_RULE>...</NEW_RULE> で囲め。\n{pd.DataFrame(history).to_string()}").text
+                st.info(improve_res)
+                rule2_match = re.search(r'<NEW_RULE>(.*?)</NEW_RULE>', improve_res, re.DOTALL)
+                if rule2_match: st.session_state.improved_rule = rule2_match.group(1).strip()
 
     if "improved_rule" in st.session_state:
-        st.subheader("💡 改善された新ルール (Rule 2)")
-        st.info(st.session_state.improved_rule)
-        
-        st.subheader("🛡️ Rule 2 資金管理 ＆ 監視予約")
+        st.write("---")
+        st.subheader("🛡️ Rule 2 (改善ルール) の監視予約")
         colA, colB = st.columns(2)
         with colA:
-            risk2 = st.number_input("許容損失(円)", value=10000, key="risk2")
-            side2 = st.selectbox("方向", ["buy", "sell"], key="side2")
+            risk2 = st.number_input("許容損失(円)", value=10000, key="r2")
+            side2 = st.selectbox("売買方向", ["buy", "sell"], key="s2")
         with colB:
-            ent2 = st.number_input("想定Entry", value=150.00, key="ent2")
-            tp2 = st.number_input("想定TP", value=151.00, key="tp2")
-            sl2 = st.number_input("想定SL", value=149.00, key="sl2")
+            ent2 = st.number_input("Entry", value=150.0, step=0.01, key="e2")
+            tp2 = st.number_input("TP", value=151.0, step=0.01, key="t2")
+            sl2 = st.number_input("SL", value=149.0, step=0.01, key="sl2")
         
         lots2 = round(risk2 / (abs(ent2 - sl2) * 10000), 2) if abs(ent2 - sl2) > 0 else 0.0
         st.metric("推奨ロット (Rule 2)", f"{lots2} lot")
         
-        if st.button("🚀 Rule 2 で監視予約を実行", type="primary", use_container_width=True):
+        if st.button("🚀 Rule 2 で監視予約", type="primary", use_container_width=True):
             if update_github_config(side2, ent2, tp2, sl2, lots2, "Rule 2"):
-                requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🔥 【Rule 2 監視開始】\n改善された最強ルールを適用しました。\n方向: {side2} / ロット: {lots2}\nEntry: {ent2} / TP: {tp2} / SL: {sl2}"})
-                requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%m/%d %H:%M'), "side": side2, "entry": ent2, "lots": lots2, "result": "待機中(Rule 2)"})
+                requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🔥 【Rule 2 予約確定】\n改善ルールによる監視を開始しました。\nロット: {lots2}\nEntry: {ent2} / TP: {tp2} / SL: {sl2}"})
+                requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%m/%d %H:%M'), "side": f"Rule 2({side2})", "entry": ent2, "lots": lots2, "result": "待機中"})
                 st.success("Rule 2 予約完了！")
