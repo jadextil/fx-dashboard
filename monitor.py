@@ -3,7 +3,6 @@ import requests
 import os
 import json
 import base64
-import pandas as pd
 from datetime import datetime
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -28,10 +27,10 @@ def check_price():
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers).json()
     if "content" not in res: return
-    sha = res["sha"]
-    config = json.loads(base64.b64decode(res["content"]).decode('utf-8'))
+    sha, config = res["sha"], json.loads(base64.b64decode(res["content"]).decode('utf-8'))
     if not config.get("is_active"): return
 
+    rule_name = config.get("rule_name", "Unknown Rule")
     side, status = config.get("side", "buy"), config.get("status", "waiting_entry")
     entry, tp, sl, lots = config["entry"], config["tp"], config["sl"], config.get("lots", 0.0)
 
@@ -40,20 +39,37 @@ def check_price():
         current_p = float(data['Close'].iloc[-1])
     except: return
 
+    # --- エントリー通知 ---
     if status == "waiting_entry":
         if (side == "buy" and current_p <= entry + 0.02) or (side == "sell" and current_p >= entry - 0.02):
-            send_discord(f"🔔 【エントリー】方向:{side}/ロット:{lots}/現在:{current_p:.3f}")
+            send_discord(f"🔔 【{rule_name} エントリー】\n方向: {side} / ロット: {lots}\n現在価格がターゲット({entry})に到達しました。")
             config["status"] = "holding"
             update_config_status(config, sha)
+
+    # --- 決済通知 ---
     elif status == "holding":
         is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
         is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
         if is_win or is_lose:
             exit_p = tp if is_win else sl
             pnl = int((exit_p - entry) * lots * 10000) if side == "buy" else int((entry - exit_p) * lots * 10000)
-            send_discord(f"{'💰 利確' if is_win else '⚠️ 損切'}\n損益:{pnl:,}円")
-            send_to_spreadsheet({"date": datetime.now().strftime('%Y-%m-%d %H:%M'), "side": side, "entry": entry, "exit": exit_p, "result": "WIN" if is_win else "LOSE", "pnl": pnl, "lots": lots})
-            config["is_active"], config["status"] = False, "done"
+            res_txt = "利確 🎉" if is_win else "損切り 😢"
+            
+            send_discord(f"{'💰' if is_win else '⚠️'} 【{rule_name} 決済完了】\n結果: {res_txt}\n損益: {pnl:,}円\n次のトレードまで待機します。")
+            
+            send_to_spreadsheet({
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                "side": f"{rule_name}({side})",
+                "entry": entry,
+                "exit": exit_p,
+                "result": res_txt,
+                "pnl": pnl,
+                "lots": lots
+            })
+            
+            # 監視をオフにし、ステータスを完了にする
+            config["is_active"] = False
+            config["status"] = "done"
             update_config_status(config, sha)
 
 if __name__ == "__main__": check_price()
