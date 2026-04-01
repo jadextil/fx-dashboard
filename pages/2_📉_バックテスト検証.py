@@ -22,9 +22,7 @@ def add_indicators(df):
     df['Upper2'] = df['SMA20'] + (std * 2)
     df['Lower2'] = df['SMA20'] - (std * 2)
     delta = df['Close'].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -1 * delta.clip(upper=0).rolling(14).mean()
-    df['RSI'] = 100 - (100 / (1 + gain/loss))
+    df['RSI'] = 100 - (100 / (1 + (delta.clip(lower=0).rolling(14).mean() / -delta.clip(upper=0).rolling(14).mean())))
     return df.dropna()
 
 def run_ai_backtest(ticker, rule_text):
@@ -34,52 +32,80 @@ def run_ai_backtest(ticker, rule_text):
     for idx, row in df.iterrows():
         price_data += f"{idx.strftime('%m/%d %H:%M')},終:{row['Close']:.2f},BB上:{row['Upper2']:.2f},BB下:{row['Lower2']:.2f},RSI:{row['RSI']:.1f}\n"
 
-    prompt = f"以下のルールを価格データに適用し、全トレードをJSONリスト形式 [{{'side':'buy','entry_price':0,'exit_price':0,'entry_time':'...','exit_time':'...','reason':'...'}}] のみで出力せよ。\n\n【ルール】\n{rule_text}\n\n【データ】\n{price_data}"
+    prompt = f"以下のルールをデータに適用し、全トレードをJSONリスト [{{'side':'buy','entry_price':0,'exit_price':0,'entry_time':'...','exit_time':'...','reason':'...'}}] で出力せよ。解説不要。\n\n【ルール】\n{rule_text}\n\n【データ】\n{price_data}"
     try:
         res = model.generate_content(prompt).text
         match = re.search(r'\[.*\]', res, re.DOTALL)
         return json.loads(match.group()) if match else []
     except: return []
 
-def evaluate_and_improve(rule_text, trades_df):
-    prompt = f"以下のルールと結果を分析し、改善案を提示せよ。新ルールを <NEW_RULE>...</NEW_RULE> で囲むこと。\n\n【ルール】\n{rule_text}\n\n【結果】\n{trades_df.to_string()}"
-    res = model.generate_content(prompt).text
-    eval_text = re.sub(r'<NEW_RULE>.*?</NEW_RULE>', '', res, flags=re.DOTALL).strip()
-    match = re.search(r'<NEW_RULE>(.*?)</NEW_RULE>', res, re.DOTALL)
-    new_rule = match.group(1).strip() if match else rule_text
-    return eval_text, new_rule
-
-st.title("📉 バックテスト検証 ＆ AI自動改善 PRO")
+st.title("📉 バックテスト検証 ＆ AI自動改善")
 
 if "saved_rule_text" in st.session_state and st.session_state.saved_rule_text:
-    with st.expander("現在の検証ルール"): st.write(st.session_state.saved_rule_text)
     target_pair = st.selectbox("テストペア", ["JPY=X", "EURUSD=X", "GBPJPY=X"])
     
     if st.button("🚀 精密バックテストを実行", type="primary", use_container_width=True):
-        with st.spinner("解析中..."):
+        with st.spinner("AIが全トレードを計算中..."):
             trades = run_ai_backtest(target_pair, st.session_state.saved_rule_text)
             if trades:
-                balance = 1000000
+                initial_balance = 1000000
+                balance = initial_balance
                 history = []
+                win_count = 0
+                
                 for t in trades:
                     e, ex = float(t['entry_price']), float(t['exit_price'])
-                    pnl = (ex - e)/e if t.get('side')=='buy' else (e - ex)/e
-                    balance *= (1 + pnl)
-                    t['pnl_rate'] = pnl * 100
-                    t['balance'] = int(balance)
-                    history.append(t)
-                st.session_state.test_results_df = pd.DataFrame(history)
-                st.session_state.final_balance = balance
+                    # 損益率計算
+                    pnl_rate = (ex - e)/e if t.get('side')=='buy' else (e - ex)/e
+                    # 円建て損益（現在の残高に対して計算）
+                    profit_yen = int(balance * pnl_rate)
+                    balance += profit_yen
+                    
+                    win_loss = "✅ 勝ち" if profit_yen > 0 else "❌ 負け"
+                    if profit_yen > 0: win_count += 1
+                    
+                    history.append({
+                        "結果": win_loss,
+                        "売買": t.get('side'),
+                        "損益(円)": f"{profit_yen:+,}円",
+                        "利率": f"{pnl_rate*100:.2f}%",
+                        "エントリー価格": e,
+                        "決済価格": ex,
+                        "入った時間": t.get('entry_time'),
+                        "出た時間": t.get('exit_time'),
+                        "残高": f"{int(balance):,}円",
+                        "理由": t.get('reason')
+                    })
+                
+                st.session_state.backtest_results = history
+                st.session_state.backtest_summary = {
+                    "final_balance": balance,
+                    "net_profit": balance - initial_balance,
+                    "win_rate": (win_count / len(trades)) * 100,
+                    "count": len(trades)
+                }
 
-    if "test_results_df" in st.session_state:
-        st.metric("最終資産", f"{st.session_state.final_balance:,.0f} 円")
-        st.dataframe(st.session_state.test_results_df, use_container_width=True)
-        if st.button("💡 敗因を分析して改善する"):
-            eval_text, new_r = evaluate_and_improve(st.session_state.saved_rule_text, st.session_state.test_results_df)
-            st.info(eval_text)
-            st.session_state.improved_rule = new_r
-            if st.button("新ルールを上書き適用"):
-                st.session_state.saved_rule_text = new_r
-                st.rerun()
+    if "backtest_results" in st.session_state:
+        summary = st.session_state.backtest_summary
+        
+        # 概要をメトリックで表示
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("最終資産", f"{int(summary['final_balance']):,} 円")
+        c2.metric("純損益", f"{int(summary['net_profit']):+,} 円")
+        c3.metric("勝率", f"{summary['win_rate']:.1f} %")
+        c4.metric("取引回数", f"{summary['count']} 回")
+        
+        st.write("### 📜 詳細トレード履歴")
+        st.table(pd.DataFrame(st.session_state.backtest_results))
+        
+        if st.button("💡 この結果からルールを改善する"):
+            # 改善ロジック（省略せず維持）
+            prompt = f"以下の結果を分析し、改善案を出せ。新ルールを <NEW_RULE>...</NEW_RULE> で囲め。\n\n{pd.DataFrame(st.session_state.backtest_results).to_string()}"
+            res = model.generate_content(prompt).text
+            st.info(res)
+            match = re.search(r'<NEW_RULE>(.*?)</NEW_RULE>', res, re.DOTALL)
+            if match:
+                st.session_state.saved_rule_text = match.group(1).strip()
+                st.success("新ルールを保存しました。再テスト可能です。")
 else:
     st.info("分析室ページでルールを作成してください。")
