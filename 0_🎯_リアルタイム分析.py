@@ -34,30 +34,41 @@ if "target_prices" not in st.session_state:
 def get_market_indicators():
     """
     ウォール街が重視する3大指標を取得。
-    ※ドルインデックスは安定取得のため先物(DX=F)を使用します。
+    ※ドルインデックスは安定取得のため3段構えの回避策を実装
     """
-    indicators = {
-        "TNX": "^TNX",  # 米国債10年利回り
-        "VIX": "^VIX",  # 恐怖指数
-        "DXY": "DX=F"   # ドルインデックス先物
-    }
     results = {}
     
-    for name, ticker in indicators.items():
+    # 1. 米国債10年利回り (TNX)
+    try:
+        data = yf.Ticker("^TNX").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["TNX"] = {"val": c, "diff": c - p}
+        else: results["TNX"] = {"val": 0.0, "diff": 0.0}
+    except: results["TNX"] = {"val": 0.0, "diff": 0.0}
+    
+    # 2. 恐怖指数 (VIX)
+    try:
+        data = yf.Ticker("^VIX").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["VIX"] = {"val": c, "diff": c - p}
+        else: results["VIX"] = {"val": 0.0, "diff": 0.0}
+    except: results["VIX"] = {"val": 0.0, "diff": 0.0}
+    
+    # 3. ドルインデックス (DXY)
+    dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
+    results["DXY"] = {"val": 0.0, "diff": 0.0}
+    for t in dxy_tickers:
         try:
-            # yf.Ticker().history の方が指数データは安定して取得できます
-            data = yf.Ticker(ticker).history(period="5d")
+            data = yf.Ticker(t).history(period="5d")
             if not data.empty and len(data) >= 2:
-                current = float(data['Close'].iloc[-1])
-                prev = float(data['Close'].iloc[-2])
-                diff = current - prev
-                results[name] = {"val": current, "diff": diff}
-            else:
-                results[name] = {"val": 0.0, "diff": 0.0}
-        except Exception as e:
-            st.sidebar.warning(f"{name} の取得に失敗しました: {e}")
-            results[name] = {"val": 0.0, "diff": 0.0}
-            
+                c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+                if t == "UUP": c *= 3.5; p *= 3.5
+                results["DXY"] = {"val": c, "diff": c - p}
+                break
+        except: continue
+        
     return results
 
 def get_fx_data(ticker):
@@ -65,9 +76,7 @@ def get_fx_data(ticker):
     try:
         data = yf.download(ticker, period="5d", interval="1d", progress=False)
         if not data.empty:
-            close_data = data['Close']
-            if isinstance(close_data, pd.DataFrame):
-                close_data = close_data.iloc[:, 0]
+            close_data = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
             current = float(close_data.iloc[-1])
             diff = current - float(close_data.iloc[-2])
             return current, diff
@@ -94,12 +103,10 @@ def get_wall_street_news():
             for item in root.findall('./channel/item'):
                 title = item.find('title').text
                 
-                # 重複ニュースの除外
                 if title in seen_titles:
                     continue
                 seen_titles.add(title)
                 
-                # 配信日時の取得と整形
                 pub_date_str = item.find('pubDate').text
                 try:
                     dt = email.utils.parsedate_to_datetime(pub_date_str)
@@ -109,7 +116,6 @@ def get_wall_street_news():
                 
                 news_list.append({"title": title, "date": date_formatted})
                 
-                # 30件に達したら終了
                 if len(news_list) >= 30:
                     return news_list
                     
@@ -126,7 +132,6 @@ def check_economic_calendar(news_list):
     for news in news_list:
         title = news["title"]
         if any(keyword in title for keyword in danger_keywords):
-            # タイトル内から『21:30』や『21時』などの予定時刻を探す
             time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', title)
             sched_time = time_match.group(0) if time_match else "時間未定"
             events.append({"title": title, "time": sched_time})
@@ -134,7 +139,7 @@ def check_economic_calendar(news_list):
     return events
 
 def send_discord_message(text):
-    """Discordへの通知を独立した関数として復活"""
+    """Discordへの通知"""
     try:
         webhook_url = st.secrets["DISCORD_WEBHOOK_URL"]
         requests.post(webhook_url, json={"content": text})
@@ -142,7 +147,7 @@ def send_discord_message(text):
         st.sidebar.error(f"Discord通知エラー: {e}")
 
 def send_to_spreadsheet(data):
-    """スプレッドシートへの記帳を独立した関数として復活"""
+    """スプレッドシートへの記帳"""
     try:
         gas_url = st.secrets["GAS_WEBAPP_URL"]
         requests.post(gas_url, json=data)
@@ -158,7 +163,6 @@ def update_github_config(side, entry, tp, sl, lots):
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
         
-        # 1. 現在のファイル情報(SHA)を取得
         res = requests.get(url, headers=headers).json()
         if "sha" not in res:
             st.error("GitHubから設定ファイルを読み込めませんでした。")
@@ -166,7 +170,6 @@ def update_github_config(side, entry, tp, sl, lots):
             
         sha = res["sha"]
         
-        # 2. 新しい設定を作成してエンコード
         content_dict = {
             "side": side, 
             "entry": entry, 
@@ -179,7 +182,6 @@ def update_github_config(side, entry, tp, sl, lots):
         content_json = json.dumps(content_dict, indent=2)
         content_base64 = base64.b64encode(content_json.encode()).decode()
         
-        # 3. 上書きリクエストを送信
         payload = {
             "message": f"Update strategy ({side} at {entry})", 
             "content": content_base64, 
@@ -208,7 +210,6 @@ with col1:
     st.write("---")
     st.write("🌍 **機関投資家の注目データ**")
     
-    # マクロ3大指標の取得と表示（エラーが起きても止まらない）
     m_data = get_market_indicators()
     st.metric("📈 米10年債利回り (TNX)", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
     st.metric("📉 恐怖指数 (VIX)", f"{m_data['VIX']['val']:.2f}", f"{m_data['VIX']['diff']:.2f}")
@@ -228,7 +229,6 @@ with col1:
 # --- 中央カラム：ニュース ＆ 解析 ---
 with col2:
     st.subheader("📰 ウォール街 ＆ 国内ニュース (30件)")
-    # ニュースを日付順に表示
     news_text = "\n".join([f"[{n['date']}] {n['title']}" for n in all_news])
     st.text_area("最新ヘッドライン", value=news_text, height=200)
     
@@ -240,7 +240,6 @@ with col2:
     
     if st.button("✨ 総合解析を実行（マクロ＋テクニカル）", use_container_width=True, type="primary"):
         with st.spinner("AIがプロの視点で市場を分析中..."):
-            # AIに渡す情報にマクロ数値を注入して精度を上げる
             macro_context = f"""
             【現在のマクロ指標データ】
             ・米国債10年利回り: {m_data['TNX']['val']:.2f}%
@@ -258,8 +257,13 @@ with col2:
             
             st.session_state.strategy_result = response.text
             
-            # AIから数値だけを抜き出すJSONプロンプト
-            json_prompt = f"先ほどの戦略に基づき、監視すべき数値を以下のJSON形式のみで出力してください。{{\"side\": \"buy\"または\"sell\", \"entry\": 150.1, \"tp\": 150.5, \"sl\": 149.8}}"
+            # 🌟 AIの「売り買い」ズレを完全に防ぐ厳格プロンプト（復活させました）
+            json_prompt = f"""
+            あなたが先ほど出力した戦略に完全に一致するように、監視すべき数値を以下のJSON形式のみで出力してください。
+            ・戦略が「売り（ショート）」の場合は必ず "sell" を指定し、tp（利確）はentryより低く、sl（損切）は高く設定すること。
+            ・戦略が「買い（ロング）」の場合は必ず "buy" を指定し、tp（利確）はentryより高く、sl（損切）は低く設定すること。
+            出力例: {{"side": "sell", "entry": 150.10, "tp": 149.50, "sl": 150.50}}
+            """
             json_res = model.generate_content(json_prompt).text
             match = re.search(r'\{.*\}', json_res, re.DOTALL)
             if match:
@@ -278,7 +282,10 @@ with col3:
             
             risk_cash = st.number_input("1トレードの許容損失額 (円)", value=10000, step=1000)
             
-            side = st.selectbox("売買方向", ["buy", "sell"], index=0 if tp_data['side']=="buy" else 1)
+            # 🌟 AIの判定を初期値に正しく反映させる
+            side_index = 0 if tp_data.get('side', 'buy') == 'buy' else 1
+            side = st.selectbox("売買方向", ["buy", "sell"], index=side_index)
+            
             t_entry = st.number_input("エントリー価格", value=float(tp_data['entry']), step=0.01)
             t_tp = st.number_input("利確目標 (TP)", value=float(tp_data['tp']), step=0.01)
             t_sl = st.number_input("損切ライン (SL)", value=float(tp_data['sl']), step=0.01)
