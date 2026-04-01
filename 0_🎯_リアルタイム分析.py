@@ -11,6 +11,7 @@ import requests
 import json
 import re
 import base64
+import plotly.graph_objects as go  # 🌟 チャート自動描画用のライブラリを追加
 
 # --- 0. 初期設定 ---
 st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室", layout="wide")
@@ -29,13 +30,11 @@ if "strategy_result" not in st.session_state:
 if "target_prices" not in st.session_state:
     st.session_state.target_prices = None
 
-# --- 1. 共通関数群（省略なしの完全版） ---
+# --- 1. 共通関数群 ---
 
 def get_market_indicators():
     """ウォール街が重視する3大指標を取得。"""
     results = {}
-    
-    # 1. 米国債10年利回り (TNX)
     try:
         data = yf.Ticker("^TNX").history(period="5d")
         if not data.empty and len(data) >= 2:
@@ -44,7 +43,6 @@ def get_market_indicators():
         else: results["TNX"] = {"val": 0.0, "diff": 0.0}
     except: results["TNX"] = {"val": 0.0, "diff": 0.0}
     
-    # 2. 恐怖指数 (VIX)
     try:
         data = yf.Ticker("^VIX").history(period="5d")
         if not data.empty and len(data) >= 2:
@@ -53,7 +51,6 @@ def get_market_indicators():
         else: results["VIX"] = {"val": 0.0, "diff": 0.0}
     except: results["VIX"] = {"val": 0.0, "diff": 0.0}
     
-    # 3. ドルインデックス (DXY)
     dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
     results["DXY"] = {"val": 0.0, "diff": 0.0}
     for t in dxy_tickers:
@@ -65,20 +62,41 @@ def get_market_indicators():
                 results["DXY"] = {"val": c, "diff": c - p}
                 break
         except: continue
-        
     return results
 
-def get_fx_data(ticker):
+def get_technical_chart_data(ticker="JPY=X"):
+    """🌟 1時間足のデータを取得し、テクニカル指標を自動計算する"""
     try:
-        data = yf.download(ticker, period="5d", interval="1d", progress=False)
-        if not data.empty:
-            close_data = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
-            current = float(close_data.iloc[-1])
-            diff = current - float(close_data.iloc[-2])
-            return current, diff
+        data = yf.download(ticker, period="5d", interval="1h", progress=False)
+        if data.empty: return None, {}
+        
+        # yfinanceのバージョンによるデータ構造(MultiIndex)の吸収
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
+            
+        close = data['Close']
+        
+        # 移動平均線 (SMA20, SMA50)
+        data['SMA20'] = close.rolling(window=20).mean()
+        data['SMA50'] = close.rolling(window=50).mean()
+        
+        # RSI(14) の計算
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(window=14).mean()
+        loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
+        rs = gain / loss
+        data['RSI14'] = 100 - (100 / (1 + rs))
+        
+        latest_tech = {
+            "current": float(close.iloc[-1]),
+            "sma20": float(data['SMA20'].iloc[-1]),
+            "sma50": float(data['SMA50'].iloc[-1]),
+            "rsi14": float(data['RSI14'].iloc[-1])
+        }
+        return data, latest_tech
     except Exception as e:
-        st.sidebar.warning(f"為替データの取得に失敗しました: {e}")
-    return 0, 0
+        st.warning(f"チャートデータ取得エラー: {e}")
+        return None, {}
 
 def get_wall_street_news():
     urls = [
@@ -88,13 +106,11 @@ def get_wall_street_news():
     ]
     news_list = []
     seen_titles = set()
-    
     try:
         for url in urls:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
                 root = ET.fromstring(response.read())
-                
             for item in root.findall('./channel/item'):
                 title = item.find('title').text
                 if title in seen_titles: continue
@@ -168,13 +184,18 @@ def update_github_config(side, entry, tp, sl, lots):
 # ==========================================
 st.title("🎯 釘田式・プロ仕様 FX AI指令室")
 
-col1, col2, col3 = st.columns([1.2, 2, 2])
+# チャートを大きく見せるために中央の幅を広く設定
+col1, col2, col3 = st.columns([1.2, 2.2, 1.8])
 
 # --- 左カラム：市場データ ＆ マクロ指標 ---
 with col1:
     st.subheader("📊 為替 ＆ マクロ指標")
-    usd_p, usd_d = get_fx_data("JPY=X")
-    st.metric("🇺🇸 ドル/円 (USD/JPY)", f"{usd_p:.3f} 円", f"{usd_d:.3f}")
+    
+    # 🌟 チャートデータとテクニカル数値を一括取得
+    chart_data, tech_vals = get_technical_chart_data("JPY=X")
+    usd_p = tech_vals.get("current", 0.0)
+    
+    st.metric("🇺🇸 ドル/円 (USD/JPY)", f"{usd_p:.3f} 円")
     
     st.write("---")
     st.write("🌍 **機関投資家の注目データ**")
@@ -194,38 +215,60 @@ with col1:
     else:
         st.success("本日の主要指標予定は見当たりません。")
 
-# --- 中央カラム：ニュース ＆ 解析 ---
+# --- 中央カラム：自動チャート ＆ ニュース ＆ 解析 ---
 with col2:
-    st.subheader("📰 ウォール街 ＆ 国内ニュース (30件)")
-    news_text = "\n".join([f"[{n['date']}] {n['title']}" for n in all_news])
-    st.text_area("最新ヘッドライン", value=news_text, height=200)
+    st.subheader("📈 テクニカルチャート (1時間足)")
     
+    # 🌟 Plotlyを使ったローソク足チャートの自動描画
+    if chart_data is not None:
+        fig = go.Figure(data=[go.Candlestick(x=chart_data.index,
+                        open=chart_data['Open'], high=chart_data['High'],
+                        low=chart_data['Low'], close=chart_data['Close'],
+                        name='ローソク足')])
+        
+        # 移動平均線の追加
+        fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA20'], line=dict(color='orange', width=1.5), name='SMA20'))
+        fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA50'], line=dict(color='blue', width=1.5), name='SMA50'))
+        
+        fig.update_layout(height=350, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 現在のテクニカル数値を表示
+        st.caption(f"💡 現在のテクニカル: 【RSI(14)】{tech_vals.get('rsi14', 0):.1f}  【SMA20】{tech_vals.get('sma20', 0):.2f}円  【SMA50】{tech_vals.get('sma50', 0):.2f}円")
+    else:
+        st.warning("チャートデータを取得できませんでした。")
+
     st.write("---")
-    st.subheader("📸 テクニカル分析 (画像解析)")
-    uploaded_file = st.file_uploader("チャート画像を分析（任意）", type=["png", "jpg", "jpeg"])
-    if uploaded_file:
-        st.image(uploaded_file, use_container_width=True)
+    st.subheader("📰 ウォール街 ＆ 国内ニュース")
+    news_text = "\n".join([f"[{n['date']}] {n['title']}" for n in all_news])
     
-    if st.button("✨ 総合解析を実行（マクロ＋テクニカル）", use_container_width=True, type="primary"):
-        with st.spinner("AIがプロの視点で市場を分析中..."):
-            macro_context = f"""
-            【現在のマクロ指標データ】
+    # ニュース枠をスッキリさせるためにアコーディオン（折りたたみ）化
+    with st.expander("ニュース・ヘッドライン（30件）を開く"):
+        st.text_area("", value=news_text, height=200, label_visibility="collapsed")
+    
+    if st.button("✨ 総合解析を実行（全自動データ注入）", use_container_width=True, type="primary"):
+        with st.spinner("AIがプロの視点で市場とチャート数値を分析中..."):
+            
+            # 🌟 AIに渡すプロンプトに「テクニカルの具体的な数値」を直接注入！
+            ai_context = f"""
+            【現在の市場データ（ドル円: {usd_p:.3f}円）】
+            ▼ テクニカル指標 (1時間足)
+            ・RSI(14): {tech_vals.get('rsi14', 0):.1f} (※70以上は買われすぎ、30以下は売られすぎ)
+            ・20期間移動平均線(SMA20): {tech_vals.get('sma20', 0):.3f}円
+            ・50期間移動平均線(SMA50): {tech_vals.get('sma50', 0):.3f}円
+
+            ▼ マクロ指標データ
             ・米国債10年利回り: {m_data['TNX']['val']:.2f}%
             ・恐怖指数(VIX): {m_data['VIX']['val']:.2f}
             ・ドルインデックス(DXY): {m_data['DXY']['val']:.2f}
             """
             
-            prompt = f"現在のドル円{usd_p:.3f}円。以下のマクロ指標とニュース30件、添付のチャート（あれば）を総合的に判断し、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n{macro_context}\n{news_text}"
+            prompt = f"以下の【市場データ】と【ニュース30件】を総合的に判断し、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
             
-            if uploaded_file:
-                img = Image.open(uploaded_file)
-                response = model.generate_content([prompt, img])
-            else:
-                response = model.generate_content(prompt)
-            
+            # 画像の送信は不要になり、テキストのみで圧倒的に高精度な分析を行う
+            response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
             
-            # 🌟 修正ポイント：AIに「今の価格」と「さっき考えた戦略」を突きつけて抜き出させる！
             json_prompt = f"""
             現在のドル円価格は {usd_p:.3f} 円です。
             以下の【あなたが作成した戦略】を正確に読み取り、監視すべき数値をJSON形式のみで出力してください。
@@ -249,7 +292,10 @@ with col2:
 with col3:
     st.subheader("💡 今日のトレード戦略")
     if st.session_state.strategy_result:
-        st.info(st.session_state.strategy_result)
+        
+        # 戦略結果をスクロール可能な枠に収める
+        with st.container(height=350):
+            st.info(st.session_state.strategy_result)
         
         if st.session_state.target_prices:
             tp_data = st.session_state.target_prices
