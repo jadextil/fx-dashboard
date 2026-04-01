@@ -7,96 +7,79 @@ import re
 
 st.set_page_config(page_title="釘田式・バックテスト PRO", layout="wide")
 
-MODEL_NAME = 'gemini-2.5-flash' 
-
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel(MODEL_NAME)
-except Exception as e:
-    st.error(f"APIエラー: {e}")
-    st.stop()
+    model = genai.GenerativeModel('gemini-2.5-flash')
+except: st.stop()
 
 def add_indicators(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
     df = df.copy()
-    # SMA & BB
     df['SMA20'] = df['Close'].rolling(window=20).mean()
-    df['StdDev'] = df['Close'].rolling(window=20).std()
-    df['Upper2'] = df['SMA20'] + (df['StdDev'] * 2)
-    df['Lower2'] = df['SMA20'] - (df['StdDev'] * 2)
-    # RSI
+    std = df['Close'].rolling(window=20).std()
+    df['Upper2'] = df['SMA20'] + (std * 2)
+    df['Lower2'] = df['SMA20'] - (std * 2)
     delta = df['Close'].diff()
-    gain = delta.clip(lower=0).rolling(window=14).mean()
-    loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI14'] = 100 - (100 / (1 + rs))
-    # ATR
-    df['ATR'] = (df['High'] - df['Low']).rolling(window=14).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -1 * delta.clip(upper=0).rolling(14).mean()
+    df['RSI'] = 100 - (100 / (1 + gain/loss))
     return df.dropna()
 
-def run_ai_interpretive_backtest(ticker, rule_text):
+def run_ai_backtest(ticker, rule_text):
     df = yf.download(ticker, period="1mo", interval="1h", progress=False)
     df = add_indicators(df)
-    
     price_data = ""
-    for index, row in df.iterrows():
-        price_data += (f"{index.strftime('%m/%d %H:%M')},終:{row['Close']:.3f},BB上:{row['Upper2']:.3f},BB下:{row['Lower2']:.3f},"
-                       f"SMA20:{row['SMA20']:.3f},RSI:{row['RSI14']:.1f},ATR:{row['ATR']:.3f}\n")
+    for idx, row in df.iterrows():
+        price_data += f"{idx.strftime('%m/%d %H:%M')},終:{row['Close']:.2f},BB上:{row['Upper2']:.2f},BB下:{row['Lower2']:.2f},RSI:{row['RSI']:.1f}\n"
 
-    ai_prompt = f"""
-    あなたは凄腕のバックテスト・エージェントです。以下の【ルール】を【価格データ】に厳密に適用してください。
-    
-    【ルール】
-    {rule_text}
-    【価格データ】
-    {price_data}
-
-    【判定のルール】
-    - 未来予知は禁止。その瞬間のデータのみで判断すること。
-    - BBのバンドウォークや、RSIの過熱感、ATRによる値幅を考慮したルール実行を徹底してください。
-    - 条件に合致しない期間は「ノーエントリー」を維持してください。
-    
-    【出力形式】
-    JSONリストのみ出力。
-    [
-      {{"side": "buy", "entry_time": "MM/DD HH:MM", "exit_time": "MM/DD HH:MM", "entry_price": 0.0, "exit_price": 0.0, "reason": "根拠"}}
-    ]
-    """
-    
+    prompt = f"以下のルールを価格データに適用し、全トレードをJSONリスト形式 [{{'side':'buy','entry_price':0,'exit_price':0,'entry_time':'...','exit_time':'...','reason':'...'}}] のみで出力せよ。\n\n【ルール】\n{rule_text}\n\n【データ】\n{price_data}"
     try:
-        response = model.generate_content(ai_prompt)
-        json_str = re.search(r'\[.*\]', response.text, re.DOTALL).group()
-        return json.loads(json_str)
-    except:
-        return []
+        res = model.generate_content(prompt).text
+        match = re.search(r'\[.*\]', res, re.DOTALL)
+        return json.loads(match.group()) if match else []
+    except: return []
 
-st.title("📉 バックテスト検証 PRO")
+def evaluate_and_improve(rule_text, trades_df):
+    prompt = f"以下のルールと結果を分析し、改善案を提示せよ。新ルールを <NEW_RULE>...</NEW_RULE> で囲むこと。\n\n【ルール】\n{rule_text}\n\n【結果】\n{trades_df.to_string()}"
+    res = model.generate_content(prompt).text
+    eval_text = re.sub(r'<NEW_RULE>.*?</NEW_RULE>', '', res, flags=re.DOTALL).strip()
+    match = re.search(r'<NEW_RULE>(.*?)</NEW_RULE>', res, re.DOTALL)
+    new_rule = match.group(1).strip() if match else rule_text
+    return eval_text, new_rule
+
+st.title("📉 バックテスト検証 ＆ AI自動改善 PRO")
 
 if "saved_rule_text" in st.session_state and st.session_state.saved_rule_text:
+    with st.expander("現在の検証ルール"): st.write(st.session_state.saved_rule_text)
     target_pair = st.selectbox("テストペア", ["JPY=X", "EURUSD=X", "GBPJPY=X"])
     
     if st.button("🚀 精密バックテストを実行", type="primary", use_container_width=True):
-        with st.spinner("AIがBBとローソク足を1本ずつ照合中..."):
-            trades = run_ai_interpretive_backtest(target_pair, st.session_state.saved_rule_text)
-            
+        with st.spinner("解析中..."):
+            trades = run_ai_backtest(target_pair, st.session_state.saved_rule_text)
             if trades:
                 balance = 1000000
                 history = []
-                win_count = 0
                 for t in trades:
                     e, ex = float(t['entry_price']), float(t['exit_price'])
-                    pnl = (ex - e) / e if t.get('side') == 'buy' else (e - ex) / e
+                    pnl = (ex - e)/e if t.get('side')=='buy' else (e - ex)/e
                     balance *= (1 + pnl)
                     t['pnl_rate'] = pnl * 100
                     t['balance'] = int(balance)
-                    if pnl > 0: win_count += 1
                     history.append(t)
-                
-                st.metric("最終資産", f"{balance:,.0f} 円", f"{(balance-1000000):,.0f}")
-                st.dataframe(pd.DataFrame(history), use_container_width=True)
-            else:
-                st.warning("トレードは発生しませんでした。")
+                st.session_state.test_results_df = pd.DataFrame(history)
+                st.session_state.final_balance = balance
+
+    if "test_results_df" in st.session_state:
+        st.metric("最終資産", f"{st.session_state.final_balance:,.0f} 円")
+        st.dataframe(st.session_state.test_results_df, use_container_width=True)
+        if st.button("💡 敗因を分析して改善する"):
+            eval_text, new_r = evaluate_and_improve(st.session_state.saved_rule_text, st.session_state.test_results_df)
+            st.info(eval_text)
+            st.session_state.improved_rule = new_r
+            if st.button("新ルールを上書き適用"):
+                st.session_state.saved_rule_text = new_r
+                st.rerun()
 else:
     st.info("分析室ページでルールを作成してください。")
