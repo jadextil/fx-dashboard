@@ -10,11 +10,14 @@ from datetime import datetime
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GITHUB_TOKEN = os.environ.get("GH_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
-GAS_URL = os.environ.get("GAS_WEBAPP_URL") # 🌟 GASのURLを追加
+GAS_URL = os.environ.get("GAS_WEBAPP_URL") # 🌟 GASのURL
 
 def send_discord(text):
     if WEBHOOK_URL:
-        requests.post(WEBHOOK_URL, json={"content": text})
+        try:
+            requests.post(WEBHOOK_URL, json={"content": text})
+        except Exception as e:
+            print(f"Discord error: {e}")
 
 def send_to_spreadsheet(log_data):
     """GAS経由でスプレッドシートに結果を記帳"""
@@ -23,6 +26,8 @@ def send_to_spreadsheet(log_data):
             requests.post(GAS_URL, json=log_data)
         except Exception as e:
             print(f"GAS error: {e}")
+    else:
+        print("Error: GAS_WEBAPP_URL is not set in GitHub Secrets.")
 
 def update_config_status(config, sha):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/config.json"
@@ -46,21 +51,28 @@ def check_price():
     status = config.get("status", "waiting_entry")
     entry, tp, sl, lots = config["entry"], config["tp"], config["sl"], config.get("lots", 0.0)
 
+    # 価格の取得（より安定した Ticker.history 方式に変更）
     try:
-        data = yf.download("JPY=X", period="1d", interval="1m", progress=False)
+        data = yf.Ticker("JPY=X").history(period="1d", interval="1m")
         if data is None or data.empty: return
-        close_data = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
-        current_p = float(close_data.iloc[-1])
-    except: return
+        current_p = float(data['Close'].iloc[-1])
+    except Exception as e:
+        print(f"Price fetch error: {e}")
+        return
 
-    # --- エントリー待ち ---
+    # --- 🚪 エントリー待ち（すり抜け防止ロジックに強化！） ---
     if status == "waiting_entry":
-        if abs(current_p - entry) <= 0.03:
-            send_discord(f"🔔 【エントリー】\n方向: {side} / ロット: {lots}\n設定: {entry}円 / 現在: {current_p:.3f}円\n※DMM FXで注文を実行してください。")
+        # 買い(buy)の場合：現在価格がエントリー価格「以下」に落ちてきたら発動
+        is_entry_buy = (side == "buy" and current_p <= entry + 0.02)
+        # 売り(sell)の場合：現在価格がエントリー価格「以上」に上がってきたら発動
+        is_entry_sell = (side == "sell" and current_p >= entry - 0.02)
+
+        if is_entry_buy or is_entry_sell:
+            send_discord(f"🔔 【クラウド・エントリー到達】\n方向: {side} / ロット: {lots}\n設定: {entry}円 / 現在: {current_p:.3f}円\n※DMM FXで注文を実行してください。自動で決済監視に移行します。")
             config["status"] = "holding"
             update_config_status(config, sha)
 
-    # --- 決済待ち（利確・損切り） ---
+    # --- 🏁 決済待ち（利確・損切り） ---
     elif status == "holding":
         is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
         is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
@@ -69,7 +81,7 @@ def check_price():
             exit_price = tp if is_win else sl
             result_text = "勝ち🎉" if is_win else "負け😢"
             
-            # 🌟 損益（円）の自動計算 (DMM FX: 1ロット = 10,000通貨)
+            # 損益（円）の自動計算 (DMM FX: 1ロット = 10,000通貨)
             if side == "buy":
                 pnl = (exit_price - entry) * lots * 10000
             else:
