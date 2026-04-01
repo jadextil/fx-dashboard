@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import urllib.request
 import xml.etree.ElementTree as ET
+import email.utils
 import google.generativeai as genai
 from datetime import datetime
 from PIL import Image
@@ -18,7 +19,7 @@ try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
-except:
+except Exception as e:
     st.error("API設定（GOOGLE_API_KEY）を確認してください。")
     st.stop()
 
@@ -28,97 +29,171 @@ if "strategy_result" not in st.session_state:
 if "target_prices" not in st.session_state:
     st.session_state.target_prices = None
 
-# --- 1. 共通関数群 ---
+# --- 1. 共通関数群（省略なしの完全版） ---
 
 def get_market_indicators():
-    """ウォール街が重視する3大指標を取得"""
+    """
+    ウォール街が重視する3大指標を取得。
+    ※ドルインデックスは安定取得のため先物(DX=F)を使用します。
+    """
     indicators = {
         "TNX": "^TNX",  # 米国債10年利回り
         "VIX": "^VIX",  # 恐怖指数
-        "DXY": "DX-Y.NYB" # ドルインデックス
+        "DXY": "DX=F"   # ドルインデックス先物
     }
     results = {}
+    
     for name, ticker in indicators.items():
         try:
-            data = yf.download(ticker, period="2d", interval="1d", progress=False)
-            if not data.empty:
+            # yf.Ticker().history の方が指数データは安定して取得できます
+            data = yf.Ticker(ticker).history(period="5d")
+            if not data.empty and len(data) >= 2:
                 current = float(data['Close'].iloc[-1])
                 prev = float(data['Close'].iloc[-2])
                 diff = current - prev
                 results[name] = {"val": current, "diff": diff}
-        except:
-            results[name] = {"val": 0, "diff": 0}
+            else:
+                results[name] = {"val": 0.0, "diff": 0.0}
+        except Exception as e:
+            st.sidebar.warning(f"{name} の取得に失敗しました: {e}")
+            results[name] = {"val": 0.0, "diff": 0.0}
+            
     return results
 
 def get_fx_data(ticker):
+    """為替の最新価格と前日比を取得"""
     try:
         data = yf.download(ticker, period="5d", interval="1d", progress=False)
         if not data.empty:
-            close_data = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
+            close_data = data['Close']
+            if isinstance(close_data, pd.DataFrame):
+                close_data = close_data.iloc[:, 0]
             current = float(close_data.iloc[-1])
             diff = current - float(close_data.iloc[-2])
             return current, diff
-    except: pass
+    except Exception as e:
+        st.sidebar.warning(f"為替データの取得に失敗しました: {e}")
     return 0, 0
 
-def get_precise_calendar():
-    """
-    経済指標の予定時刻を取得。
-    ※RSSから『〇時〇分』という時間表記を抽出するように強化
-    """
-    url = "https://news.yahoo.co.jp/rss/categories/business.xml"
-    events = []
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            root = ET.fromstring(response.read())
-        
-        danger_keywords = ["雇用統計", "CPI", "消費者物価", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
-        
-        for item in root.findall('./channel/item'):
-            title = item.find('title').text
-            if any(k in title for k in danger_keywords):
-                # タイトル内から『21:30』や『21時』などの予定時刻を探す
-                time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', title)
-                sched_time = time_match.group(0) if time_match else "時間未定"
-                events.append({"title": title, "time": sched_time})
-        return events
-    except:
-        return []
-
 def get_wall_street_news():
+    """日米の主要経済ニュースを日時付きで計30件取得"""
     urls = [
         "https://news.yahoo.co.jp/rss/categories/business.xml",
-        "https://news.yahoo.co.jp/rss/categories/world.xml"
+        "https://news.yahoo.co.jp/rss/categories/world.xml",
+        "https://news.yahoo.co.jp/rss/topics/business.xml"
     ]
     news_list = []
+    seen_titles = set()
+    
     try:
         for url in urls:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
                 root = ET.fromstring(response.read())
+                
             for item in root.findall('./channel/item'):
                 title = item.find('title').text
-                if title not in news_list:
-                    news_list.append(title)
-        return news_list[:30]
-    except:
-        return []
+                
+                # 重複ニュースの除外
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                
+                # 配信日時の取得と整形
+                pub_date_str = item.find('pubDate').text
+                try:
+                    dt = email.utils.parsedate_to_datetime(pub_date_str)
+                    date_formatted = dt.astimezone().strftime("%m/%d %H:%M")
+                except:
+                    date_formatted = "日時不明"
+                
+                news_list.append({"title": title, "date": date_formatted})
+                
+                # 30件に達したら終了
+                if len(news_list) >= 30:
+                    return news_list
+                    
+        return news_list
+    except Exception as e:
+        st.sidebar.warning(f"ニュース取得エラー: {e}")
+        return [{"title": "ニュース取得エラー", "date": "--/--"}]
+
+def check_economic_calendar(news_list):
+    """ニュースから重要指標の予定時刻を抽出"""
+    danger_keywords = ["雇用統計", "CPI", "消費者物価", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
+    events = []
+    
+    for news in news_list:
+        title = news["title"]
+        if any(keyword in title for keyword in danger_keywords):
+            # タイトル内から『21:30』や『21時』などの予定時刻を探す
+            time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', title)
+            sched_time = time_match.group(0) if time_match else "時間未定"
+            events.append({"title": title, "time": sched_time})
+            
+    return events
+
+def send_discord_message(text):
+    """Discordへの通知を独立した関数として復活"""
+    try:
+        webhook_url = st.secrets["DISCORD_WEBHOOK_URL"]
+        requests.post(webhook_url, json={"content": text})
+    except Exception as e:
+        st.sidebar.error(f"Discord通知エラー: {e}")
+
+def send_to_spreadsheet(data):
+    """スプレッドシートへの記帳を独立した関数として復活"""
+    try:
+        gas_url = st.secrets["GAS_WEBAPP_URL"]
+        requests.post(gas_url, json=data)
+    except Exception as e:
+        st.sidebar.error(f"スプレッドシート記帳エラー: {e}")
 
 def update_github_config(side, entry, tp, sl, lots):
+    """GitHubのconfig.jsonを安全に更新"""
     try:
-        token, repo, path = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"], st.secrets["GITHUB_TARGET_FILE"]
+        token = st.secrets["GITHUB_TOKEN"]
+        repo = st.secrets["GITHUB_REPO"]
+        path = st.secrets["GITHUB_TARGET_FILE"]
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+        
+        # 1. 現在のファイル情報(SHA)を取得
         res = requests.get(url, headers=headers).json()
-        content_dict = {"side": side, "entry": entry, "tp": tp, "sl": sl, "lots": lots, "status": "waiting_entry", "is_active": True}
-        content_base64 = base64.b64encode(json.dumps(content_dict, indent=2).encode()).decode()
-        requests.put(url, headers=headers, json={"message": "Update strategy", "content": content_base64, "sha": res["sha"]})
-        return True
-    except: return False
+        if "sha" not in res:
+            st.error("GitHubから設定ファイルを読み込めませんでした。")
+            return False
+            
+        sha = res["sha"]
+        
+        # 2. 新しい設定を作成してエンコード
+        content_dict = {
+            "side": side, 
+            "entry": entry, 
+            "tp": tp, 
+            "sl": sl, 
+            "lots": lots,
+            "status": "waiting_entry", 
+            "is_active": True
+        }
+        content_json = json.dumps(content_dict, indent=2)
+        content_base64 = base64.b64encode(content_json.encode()).decode()
+        
+        # 3. 上書きリクエストを送信
+        payload = {
+            "message": f"Update strategy ({side} at {entry})", 
+            "content": content_base64, 
+            "sha": sha
+        }
+        response = requests.put(url, headers=headers, json=payload)
+        return response.status_code == 200
+        
+    except Exception as e:
+        st.error(f"GitHub連携エラー: {e}")
+        return False
 
 # ==========================================
-# メイン画面
+# メイン画面構築
 # ==========================================
 st.title("🎯 釘田式・プロ仕様 FX AI指令室")
 
@@ -130,43 +205,50 @@ with col1:
     usd_p, usd_d = get_fx_data("JPY=X")
     st.metric("🇺🇸 ドル/円 (USD/JPY)", f"{usd_p:.3f} 円", f"{usd_d:.3f}")
     
-    # 🌟 マクロ3大指標の表示
-    m_data = get_market_indicators()
     st.write("---")
-    st.metric("📈 米10年債利回り", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
+    st.write("🌍 **機関投資家の注目データ**")
+    
+    # マクロ3大指標の取得と表示（エラーが起きても止まらない）
+    m_data = get_market_indicators()
+    st.metric("📈 米10年債利回り (TNX)", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
     st.metric("📉 恐怖指数 (VIX)", f"{m_data['VIX']['val']:.2f}", f"{m_data['VIX']['diff']:.2f}")
     st.metric("💵 ドル指数 (DXY)", f"{m_data['DXY']['val']:.2f}", f"{m_data['DXY']['diff']:.2f}")
     
     st.write("---")
     st.subheader("📅 指標発表スケジュール")
-    calendar = get_precise_calendar()
+    all_news = get_wall_street_news()
+    calendar = check_economic_calendar(all_news)
+    
     if calendar:
         for ev in calendar[:5]:
-            st.warning(f"🕒 {ev['time']} | {ev['title']}")
+            st.warning(f"🕒 予定時刻: {ev['time']}\n{ev['title']}")
     else:
         st.success("本日の主要指標予定は見当たりません。")
 
 # --- 中央カラム：ニュース ＆ 解析 ---
 with col2:
-    all_news = get_wall_street_news()
-    news_text = "\n".join([f"・{n}" for n in all_news])
-    st.subheader("📰 最新ヘッドライン (30件)")
-    st.text_area("ニュース一覧", value=news_text, height=200)
+    st.subheader("📰 ウォール街 ＆ 国内ニュース (30件)")
+    # ニュースを日付順に表示
+    news_text = "\n".join([f"[{n['date']}] {n['title']}" for n in all_news])
+    st.text_area("最新ヘッドライン", value=news_text, height=200)
     
-    uploaded_file = st.file_uploader("チャート画像を分析", type=["png", "jpg", "jpeg"])
+    st.write("---")
+    st.subheader("📸 テクニカル分析 (画像解析)")
+    uploaded_file = st.file_uploader("チャート画像を分析（任意）", type=["png", "jpg", "jpeg"])
     if uploaded_file:
         st.image(uploaded_file, use_container_width=True)
     
-    if st.button("✨ 総合解析を実行", use_container_width=True, type="primary"):
-        with st.spinner("マクロデータとニュースを照合中..."):
-            # 🌟 AIに渡す情報にマクロ数値を注入
+    if st.button("✨ 総合解析を実行（マクロ＋テクニカル）", use_container_width=True, type="primary"):
+        with st.spinner("AIがプロの視点で市場を分析中..."):
+            # AIに渡す情報にマクロ数値を注入して精度を上げる
             macro_context = f"""
-            【マクロ指標データ】
+            【現在のマクロ指標データ】
             ・米国債10年利回り: {m_data['TNX']['val']:.2f}%
             ・恐怖指数(VIX): {m_data['VIX']['val']:.2f}
             ・ドルインデックス(DXY): {m_data['DXY']['val']:.2f}
             """
-            prompt = f"現在{usd_p:.3f}円。以下のマクロ指標とニュース30件、チャートから戦略を立てて。\n{macro_context}\n{news_text}"
+            
+            prompt = f"現在のドル円{usd_p:.3f}円。以下のマクロ指標とニュース30件、添付のチャート（あれば）を総合的に判断し、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n{macro_context}\n{news_text}"
             
             if uploaded_file:
                 img = Image.open(uploaded_file)
@@ -176,29 +258,58 @@ with col2:
             
             st.session_state.strategy_result = response.text
             
-            # 数値抽出
-            json_res = model.generate_content(f"以下をJSONのみで。{{\"side\": \"buy\"/\"sell\", \"entry\": 150.1, \"tp\": 150.5, \"sl\": 149.8}}").text
+            # AIから数値だけを抜き出すJSONプロンプト
+            json_prompt = f"先ほどの戦略に基づき、監視すべき数値を以下のJSON形式のみで出力してください。{{\"side\": \"buy\"または\"sell\", \"entry\": 150.1, \"tp\": 150.5, \"sl\": 149.8}}"
+            json_res = model.generate_content(json_prompt).text
             match = re.search(r'\{.*\}', json_res, re.DOTALL)
             if match:
                 st.session_state.target_prices = json.loads(match.group())
 
 # --- 右カラム：戦略 ＆ 資金管理 ---
 with col3:
+    st.subheader("💡 今日のトレード戦略")
     if st.session_state.strategy_result:
         st.info(st.session_state.strategy_result)
+        
         if st.session_state.target_prices:
             tp_data = st.session_state.target_prices
             st.write("---")
-            risk_cash = st.number_input("許容損失額 (円)", value=10000, step=1000)
-            side = st.selectbox("売買方向", ["buy", "sell"], index=0 if tp_data['side']=="buy" else 1)
-            t_entry = st.number_input("エントリー", value=float(tp_data['entry']), step=0.01)
-            t_tp = st.number_input("利確(TP)", value=float(tp_data['tp']), step=0.01)
-            t_sl = st.number_input("損切(SL)", value=float(tp_data['sl']), step=0.01)
+            st.subheader("🛡️ DMM FX 資金管理設定")
             
+            risk_cash = st.number_input("1トレードの許容損失額 (円)", value=10000, step=1000)
+            
+            side = st.selectbox("売買方向", ["buy", "sell"], index=0 if tp_data['side']=="buy" else 1)
+            t_entry = st.number_input("エントリー価格", value=float(tp_data['entry']), step=0.01)
+            t_tp = st.number_input("利確目標 (TP)", value=float(tp_data['tp']), step=0.01)
+            t_sl = st.number_input("損切ライン (SL)", value=float(tp_data['sl']), step=0.01)
+            
+            # ロット計算 (DMM FX: 1ロット=10,000通貨)
             pips_risk = abs(t_entry - t_sl)
             calc_lots = risk_cash / (pips_risk * 10000) if pips_risk > 0 else 0.0
-            st.metric("💡 推奨ロット数", f"{round(calc_lots, 2)} ロット")
+            calc_lots = round(calc_lots, 2)
+            
+            st.metric("💡 推奨ロット数", f"{calc_lots} ロット", f"損切時の損失を 約{risk_cash}円 に固定")
 
             if st.button("🚀 24時間監視予約", use_container_width=True, type="primary"):
-                if update_github_config(side, t_entry, t_tp, t_sl, round(calc_lots, 2)):
-                    st.success("予約完了！ 決済時にスプレッドシートへ自動記帳されます。")
+                # 1. GitHubへ予約送信
+                if update_github_config(side, t_entry, t_tp, t_sl, calc_lots):
+                    
+                    # 2. 予約段階の暫定データをスプレッドシートに記録（不要なら削除可）
+                    log_data = {
+                        "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        "side": "買い(予約)" if side == "buy" else "売り(予約)",
+                        "entry": t_entry,
+                        "exit": 0,
+                        "result": "待機中",
+                        "pnl": 0,
+                        "lots": calc_lots
+                    }
+                    send_to_spreadsheet(log_data)
+                    
+                    # 3. Discordへ通知
+                    msg = f"🎯 【予約確定】\n方向: {side} / ロット: {calc_lots}\nエントリー: {t_entry}円\n利確: {t_tp}円 / 損切: {t_sl}円"
+                    send_discord_message(msg)
+                    
+                    st.success("予約完了！ 決済時に正確な損益がスプレッドシートへ自動記帳されます。")
+    else:
+        st.write("「総合解析を実行」ボタンを押すと、戦略が表示されます。")
