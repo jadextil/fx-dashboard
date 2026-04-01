@@ -3,6 +3,7 @@ import requests
 import os
 import json
 import base64
+import pandas as pd
 
 # GitHub Secretsから読み込み
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -44,33 +45,48 @@ def check_price():
     if not config.get("is_active"):
         return # 監視がオフなら終了
 
+    # 🌟 「売り(sell)」「買い(buy)」の方向を取得（古い設定ファイル対策でデフォルトはbuy）
+    side = config.get("side", "buy")
     status = config.get("status", "waiting_entry")
     entry = config["entry"]
     tp = config["tp"]
     sl = config["sl"]
 
-    # 2. 現在価格を取得
-    data = yf.Ticker("JPY=X").history(period="1d", interval="1m")
-    if data.empty:
+    # 2. 現在価格を取得（エラーが起きにくい download方式）
+    try:
+        data = yf.download("JPY=X", period="1d", interval="1m", progress=False)
+        if data is None or data.empty:
+            return
+            
+        # yfinanceのバージョンによるデータ構造の違いを吸収
+        close_data = data['Close']
+        if isinstance(close_data, pd.DataFrame):
+            close_data = close_data.iloc[:, 0]
+        current_p = float(close_data.iloc[-1])
+    except Exception as e:
+        print(f"Error fetching price: {e}")
         return
-    current_p = float(data['Close'].iloc[-1])
 
     # 3. 状態(フェーズ)に応じた監視ロジック
     if status == "waiting_entry":
         if abs(current_p - entry) <= 0.03:
-            send_discord(f"🔔 【クラウド・エントリー到達】\n設定({entry}円)付近です！\n現在: {current_p:.3f}円\n自動で利確・損切りの監視に移行します。")
+            send_discord(f"🔔 【クラウド・エントリー到達】\n方向: {side} / 設定: {entry}円\n現在: {current_p:.3f}円\n自動で利確・損切りの監視に移行します。")
             config["status"] = "holding" # 状態を「保有中」に変更
             update_config_status(config, sha)
 
     elif status == "holding":
-        if current_p >= tp:
-            send_discord(f"💰 【クラウド・利確達成】\n目標の{tp}円に到達！\n現在: {current_p:.3f}円\n本日の監視を完全終了します。")
+        # 🌟 売り・買いで利確/損切りの判定を逆転させる
+        is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
+        is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
+
+        if is_win:
+            send_discord(f"💰 【クラウド・利確達成】\n方向: {side} / 目標の{tp}円に到達！\n現在: {current_p:.3f}円\n本日の監視を完全終了します。")
             config["is_active"] = False
             config["status"] = "done"
             update_config_status(config, sha)
             
-        elif current_p <= sl:
-            send_discord(f"⚠️ 【クラウド・損切り到達】\n撤退ラインの{sl}円に到達。\n現在: {current_p:.3f}円\n本日の監視を完全終了します。")
+        elif is_lose:
+            send_discord(f"⚠️ 【クラウド・損切り到達】\n方向: {side} / 撤退ラインの{sl}円に到達。\n現在: {current_p:.3f}円\n本日の監視を完全終了します。")
             config["is_active"] = False
             config["status"] = "done"
             update_config_status(config, sha)
