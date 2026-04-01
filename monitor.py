@@ -3,7 +3,6 @@ import requests
 import os
 import json
 import base64
-import pandas as pd
 from datetime import datetime
 
 # GitHub Secrets から環境変数を取得
@@ -39,116 +38,123 @@ def update_config_status(config, sha):
     content_base64 = base64.b64encode(content_json.encode()).decode()
     
     payload = {
-        "message": "Update status by Indicator Monitor",
+        "message": "Update status by Monitor",
         "content": content_base64,
         "sha": sha
     }
     requests.put(url, headers=headers, json=payload)
 
-def calculate_indicators(df):
-    """監視に必要なインジケーターを計算"""
-    df = df.copy()
-    close = df['Close']
-    # SMA
-    df['SMA20'] = close.rolling(window=20).mean()
-    df['SMA50'] = close.rolling(window=50).mean()
-    # Bollinger Bands
-    std = close.rolling(window=20).std()
-    df['Upper2'] = df['SMA20'] + (std * 2)
-    df['Lower2'] = df['SMA20'] - (std * 2)
-    # RSI
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(window=14).mean()
-    loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
-    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
-    return df.dropna()
-
 def check_price():
-    """インジケーター条件を判定するメインロジック"""
+    """価格をチェックし、エントリー・決済の判定を行うメインロジック"""
     # 1. GitHubから現在の設定を取得
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/config.json"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
     
     try:
         res = requests.get(url, headers=headers).json()
-        if "content" not in res: return
+        if "content" not in res:
+            print("config.json not found.")
+            return
+        
         sha = res["sha"]
         config = json.loads(base64.b64decode(res["content"]).decode('utf-8'))
-    except: return
+    except Exception as e:
+        print(f"GitHub fetch error: {e}")
+        return
 
-    if not config.get("is_active"): return
+    # 監視が無効なら終了
+    if not config.get("is_active"):
+        print("Monitoring is currently inactive.")
+        return
 
-    rule_name = config.get("rule_name", "Rule 1")
-    rule_id = "1" if "1" in rule_name else "2"
+    # 設定値の抽出
+    rule_full_name = config.get("rule_name", "Rule 1") # "Rule 1" or "Rule 2"
+    # スプレッドシート用に "1" か "2" だけを抽出
+    rule_id = "1" if "1" in rule_full_name else "2"
+    
+    side = config.get("side", "buy")
     status = config.get("status", "waiting_entry")
+    entry = config["entry"]
+    tp = config["tp"]
+    sl = config["sl"]
     lots = config.get("lots", 0.0)
 
-    # 2. 最新データの取得とインジケーター計算
+    # 2. 現在価格の取得 (JPY=X)
     try:
-        # 1時間足の直近データを取得
-        df = yf.download("JPY=X", period="5d", interval="1h", progress=False)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = [col[0] for col in df.columns]
-        df = calculate_indicators(df)
-        
-        curr = df.iloc[-1]  # 現在の足
-        prev = df.iloc[-2]  # 1本前の足
-    except: return
+        data = yf.Ticker("JPY=X").history(period="1d", interval="1m")
+        if data.empty:
+            print("Price data is empty.")
+            return
+        current_p = float(data['Close'].iloc[-1])
+    except Exception as e:
+        print(f"Price fetch error: {e}")
+        return
 
-    # --- A. エントリー判定 (waiting_entry) ---
+    print(f"Checking {rule_full_name}: Current={current_p:.3f}, Target={entry:.3f}, Status={status}")
+
+    # --- A. エントリー待ちフェーズ ---
     if status == "waiting_entry":
-        # 買い条件判定
-        buy_trend = curr['SMA20'] > curr['SMA50']
-        buy_push  = prev['Close'] < prev['SMA20'] and curr['Close'] > curr['SMA20']
-        buy_rsi   = 40 <= curr['RSI'] < 70
-        
-        # 売り条件判定
-        sell_trend = curr['SMA20'] < curr['SMA50']
-        sell_push  = prev['Close'] > prev['SMA20'] and curr['Close'] < curr['SMA20']
-        sell_rsi   = 30 < curr['RSI'] <= 60
+        # 買いの場合: エントリー価格以下にタッチ
+        is_entry_buy = (side == "buy" and current_p <= entry + 0.02)
+        # 売りの場合: エントリー価格以上にタッチ
+        is_entry_sell = (side == "sell" and current_p >= entry - 0.02)
 
-        if buy_trend and buy_push and buy_rsi:
-            send_discord(f"🔔 【{rule_name} 買いエントリー】\n条件合致: SMAゴールデンクロス中 + 押し目上抜け\nロット: {lots}\n現在値: {curr['Close']:.3f}\n※決済監視に移行します。")
-            config.update({"status": "holding", "side": "buy", "entry": float(curr['Close'])})
-            update_config_status(config, sha)
+        if is_entry_buy or is_entry_sell:
+            # 入口通知
+            msg = (f"🔔 【{rule_full_name} エントリー到達】\n"
+                   f"方向: {side} / ロット: {lots}\n"
+                   f"設定価格: {entry:.3f}円 / 現在価格: {current_p:.3f}円\n"
+                   f"※DMM FX等で注文を確認してください。自動で決済監視に移行します。")
+            send_discord(msg)
             
-        elif sell_trend and sell_push and sell_rsi:
-            send_discord(f"🔔 【{rule_name} 売りエントリー】\n条件合致: SMAデッドクロス中 + 戻り下抜け\nロット: {lots}\n現在値: {curr['Close']:.3f}\n※決済監視に移行します。")
-            config.update({"status": "holding", "side": "sell", "entry": float(curr['Close'])})
+            # ステータスを「保持(holding)」に変更してGitHub更新
+            config["status"] = "holding"
             update_config_status(config, sha)
 
-    # --- B. 決済判定 (holding) ---
+    # --- B. 決済待ちフェーズ (利確・損切り) ---
     elif status == "holding":
-        side = config.get("side")
-        entry_price = config.get("entry")
-        
-        is_exit = False
-        res_txt = ""
-        
-        if side == "buy":
-            # 利確: BB上タッチ or RSI > 70
-            if curr['Close'] >= curr['Upper2'] or curr['RSI'] > 70:
-                is_exit, res_txt = True, "利確 🎉"
-            # 損切: デッドクロス発生
-            elif curr['SMA20'] < curr['SMA50']:
-                is_exit, res_txt = True, "損切り 😢"
-        
-        elif side == "sell":
-            # 利確: BB下タッチ or RSI < 30
-            if curr['Close'] <= curr['Lower2'] or curr['RSI'] < 30:
-                is_exit, res_txt = True, "利確 🎉"
-            # 損切: ゴールデンクロス発生
-            elif curr['SMA20'] > curr['SMA50']:
-                is_exit, res_txt = True, "損切り 😢"
+        is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
+        is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
 
-        if is_exit:
-            exit_p = float(curr['Close'])
-            pnl = int((exit_p - entry_price) * lots * 10000) if side == "buy" else int((entry_price - exit_p) * lots * 10000)
+        if is_win or is_lose:
+            exit_price = tp if is_win else sl
+            result_text = "利確 🎉" if is_win else "損切り 😢"
             
-            send_discord(f"🏁 【{rule_name} 決済完了】\n結果: {res_txt}\n決済価格: {exit_p:.3f}円\n損益: {pnl:,}円\n次の方針を待機します。")
-            send_to_spreadsheet({"date": datetime.now().strftime('%Y-%m-%d %H:%M'), "rule": rule_id, "side": "買い" if side=="buy" else "売り", "entry": entry_price, "exit": exit_p, "result": res_txt, "pnl": pnl, "lots": lots})
+            # 損益（円）の計算 (1ロット = 10,000通貨)
+            if side == "buy":
+                pnl = (exit_price - entry) * lots * 10000
+            else:
+                pnl = (entry - exit_price) * lots * 10000
+            pnl = int(pnl)
+
+            # 出口通知
+            icon = "💰" if is_win else "⚠️"
+            msg = (f"{icon} 【{rule_full_name} 決済完了】\n"
+                   f"結果: {result_text}\n"
+                   f"決済価格: {exit_price:.3f}円\n"
+                   f"推定損益: {pnl:,}円\n"
+                   f"本日の監視を終了します。")
+            send_discord(msg)
             
-            # 🌟 サイクルを回す: 決済が終わったら再度「エントリー待ち」に戻す
-            config.update({"status": "waiting_entry", "is_active": True}) 
+            # 🌟 スプレッドシートに記帳 (ルール列と売買列を分離)
+            log_data = {
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                "rule": rule_id,
+                "side": "買い" if side == "buy" else "売り",
+                "entry": entry,
+                "exit": exit_price,
+                "result": result_text,
+                "pnl": pnl,
+                "lots": lots
+            }
+            send_to_spreadsheet(log_data)
+
+            # 監視をオフにして終了状態へ
+            config["is_active"] = False
+            config["status"] = "done"
             update_config_status(config, sha)
 
 if __name__ == "__main__":
