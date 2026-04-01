@@ -5,7 +5,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import email.utils
 import google.generativeai as genai
-from datetime import datetime
+from datetime import datetime, time
+import pytz
 from PIL import Image
 import requests
 import json
@@ -14,18 +15,16 @@ import base64
 import plotly.graph_objects as go
 
 # --- 0. 初期設定 ---
-st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室", layout="wide")
+st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室 PRO", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
-    # ユーザー様の環境で動作実績のあるバージョンを指定
     model = genai.GenerativeModel('gemini-2.5-flash')
 except Exception as e:
     st.error("API設定（GOOGLE_API_KEY）を確認してください。")
     st.stop()
 
-# セッション状態の初期化
 if "strategy_result" not in st.session_state:
     st.session_state.strategy_result = ""
 if "target_prices" not in st.session_state:
@@ -33,99 +32,79 @@ if "target_prices" not in st.session_state:
 
 # --- 1. 共通関数群 ---
 
+def get_market_session():
+    """現在の時刻から、主要な市場セッションを判定する。"""
+    # 日本時間を基準にする
+    jst = pytz.timezone('Asia/Tokyo')
+    now = datetime.now(jst).time()
+    
+    sessions = []
+    if time(9, 0) <= now <= time(15, 0): sessions.append("東京市場 (Tokyo)")
+    if time(16, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(1, 0): sessions.append("ロンドン市場 (London)")
+    if time(21, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(6, 0): sessions.append("ニューヨーク市場 (NY)")
+    
+    if not sessions: sessions.append("オセアニア/時間外 (Quiet Time)")
+    return " & ".join(sessions)
+
 def get_market_indicators():
-    """ウォール街が重視する3大指標（TNX, VIX, DXY）に加え、相関資産（日経平均, S&P500）を取得。"""
+    """マクロ指標（TNX, VIX, DXY）および相関資産（N225, SPX）を取得。"""
     results = {}
-    # 米10年債利回り
-    try:
-        data = yf.Ticker("^TNX").history(period="5d")
-        if not data.empty and len(data) >= 2:
-            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
-            results["TNX"] = {"val": c, "diff": c - p}
-        else: results["TNX"] = {"val": 0.0, "diff": 0.0}
-    except: results["TNX"] = {"val": 0.0, "diff": 0.0}
+    targets = {"TNX": "^TNX", "VIX": "^VIX", "N225": "^N225", "SPX": "^GSPC"}
     
-    # 恐怖指数 (VIX)
-    try:
-        data = yf.Ticker("^VIX").history(period="5d")
-        if not data.empty and len(data) >= 2:
-            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
-            results["VIX"] = {"val": c, "diff": c - p}
-        else: results["VIX"] = {"val": 0.0, "diff": 0.0}
-    except: results["VIX"] = {"val": 0.0, "diff": 0.0}
-
-    # 🌟 相関資産：日経平均株価 (N225)
-    try:
-        data = yf.Ticker("^N225").history(period="5d")
-        if not data.empty and len(data) >= 2:
-            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
-            results["N225"] = {"val": c, "diff": c - p}
-        else: results["N225"] = {"val": 0.0, "diff": 0.0}
-    except: results["N225"] = {"val": 0.0, "diff": 0.0}
-
-    # 🌟 相関資産：S&P500指数 (SPX)
-    try:
-        data = yf.Ticker("^GSPC").history(period="5d")
-        if not data.empty and len(data) >= 2:
-            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
-            results["SPX"] = {"val": c, "diff": c - p}
-        else: results["SPX"] = {"val": 0.0, "diff": 0.0}
-    except: results["SPX"] = {"val": 0.0, "diff": 0.0}
+    for key, ticker in targets.items():
+        try:
+            data = yf.Ticker(ticker).history(period="5d")
+            if not data.empty:
+                c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+                results[key] = {"val": c, "diff": c - p}
+            else: results[key] = {"val": 0.0, "diff": 0.0}
+        except: results[key] = {"val": 0.0, "diff": 0.0}
     
-    # ドル指数 (DXY) - 複数のティッカーで安定取得を試行
     dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
     results["DXY"] = {"val": 0.0, "diff": 0.0}
     for t in dxy_tickers:
         try:
             data = yf.Ticker(t).history(period="5d")
             if not data.empty and len(data) >= 2:
-                c = float(data['Close'].iloc[-1]), float(data['Close'].iloc[-2])
-                if t == "UUP": 
-                    # UUPは価格帯が異なるため、リスト内包表記で補正
-                    c = [val * 3.5 for val in c]
-                results["DXY"] = {"val": c[0], "diff": c[0] - c[1]}
+                c, p = float(data['Close'].iloc[-1]), float(data['Close'].iloc[-2])
+                if t == "UUP": c *= 3.5; p *= 3.5
+                results["DXY"] = {"val": c, "diff": c - p}
                 break
         except: continue
     return results
 
 def get_technical_chart_data(ticker="JPY=X"):
-    """1時間足のデータを取得し、テクニカル指標（BB含む）を自動計算。さらに日足トレンドとレジサポを算出。"""
+    """短期・長期の指標、BB Width（スクイーズ）、レジサポを精密計算。"""
     try:
-        # 短期分析用（1時間足）
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
-        
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = [col[0] for col in data.columns]
+        if isinstance(data.columns, pd.MultiIndex): data.columns = [col[0] for col in data.columns]
             
         close = data['Close']
-        
-        # 移動平均線 (SMA20, SMA50)
         data['SMA20'] = close.rolling(window=20).mean()
         data['SMA50'] = close.rolling(window=50).mean()
-        
-        # ボリンジャーバンド (2σ)
         std = close.rolling(window=20).std()
         data['Upper2'] = data['SMA20'] + (std * 2)
         data['Lower2'] = data['SMA20'] - (std * 2)
         
-        # RSI(14) の計算
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(window=14).mean()
-        loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
-        rs = gain / loss
-        data['RSI14'] = 100 - (100 / (1 + rs))
-
-        # 🌟 上位足分析：日足データの取得
-        data_daily = yf.download(ticker, period="3mo", interval="1d", progress=False)
-        if isinstance(data_daily.columns, pd.MultiIndex):
-            data_daily.columns = [col[0] for col in data_daily.columns]
+        # 🌟 進化：ボリンジャーバンド幅 (BB Width) の計算
+        # 計算式: (Upper - Lower) / Middle
+        data['BB_Width'] = (data['Upper2'] - data['Lower2']) / data['SMA20']
+        avg_width = data['BB_Width'].tail(100).mean() # 過去100時間の平均幅
+        current_width = data['BB_Width'].iloc[-1]
         
-        # 日足SMA20（長期トレンドの方向性）
+        # スクイーズ判定（平均より20%以上狭ければスクイーズ）
+        is_squeeze = current_width < (avg_width * 0.8)
+        
+        delta = close.diff()
+        gain, loss = delta.clip(lower=0).rolling(14).mean(), -delta.clip(upper=0).rolling(14).mean()
+        data['RSI14'] = 100 - (100 / (1 + (gain / loss)))
+
+        data_daily = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if isinstance(data_daily.columns, pd.MultiIndex): data_daily.columns = [col[0] for col in data_daily.columns]
         daily_sma20 = data_daily['Close'].rolling(window=20).mean().iloc[-1]
         
-        # 🌟 直近5日間の最高値・最安値（重要レジサポ価格）
-        high_5d = float(data['High'].tail(120).max()) # 24時間×5日=120本
+        high_5d = float(data['High'].tail(120).max())
         low_5d = float(data['Low'].tail(120).min())
         
         latest = data.iloc[-1]
@@ -136,22 +115,20 @@ def get_technical_chart_data(ticker="JPY=X"):
             "upper2": float(latest['Upper2']),
             "lower2": float(latest['Lower2']),
             "rsi14": float(latest['RSI14']),
-            "daily_sma20": float(daily_sma20), # 日足SMA
-            "high_5d": high_5d,               # 5日高値
-            "low_5d": low_5d                  # 5日安値
+            "bb_width": float(current_width),
+            "bb_avg_width": float(avg_width),
+            "is_squeeze": is_squeeze,
+            "daily_sma20": float(daily_sma20),
+            "high_5d": high_5d,
+            "low_5d": low_5d
         }
         return data, latest_tech
     except Exception as e:
-        st.warning(f"チャートデータ取得エラー: {e}")
+        st.warning(f"データ取得エラー: {e}")
         return None, {}
 
 def get_wall_street_news():
-    """国内・海外・ビジネスの3系統からニュースを合計30件取得。"""
-    urls = [
-        "https://news.yahoo.co.jp/rss/categories/business.xml",
-        "https://news.yahoo.co.jp/rss/categories/world.xml",
-        "https://news.yahoo.co.jp/rss/topics/business.xml"
-    ]
+    urls = ["https://news.yahoo.co.jp/rss/categories/business.xml", "https://news.yahoo.co.jp/rss/categories/world.xml", "https://news.yahoo.co.jp/rss/topics/business.xml"]
     news_list = []
     seen_titles = set()
     try:
@@ -163,238 +140,127 @@ def get_wall_street_news():
                 title = item.find('title').text
                 if title in seen_titles: continue
                 seen_titles.add(title)
-                
                 pub_date_str = item.find('pubDate').text
                 try:
                     dt = email.utils.parsedate_to_datetime(pub_date_str)
                     date_formatted = dt.astimezone().strftime("%m/%d %H:%M")
-                except: date_formatted = "日時不明"
-                
+                except: date_formatted = "不明"
                 news_list.append({"title": title, "date": date_formatted})
                 if len(news_list) >= 30: return news_list
         return news_list
-    except Exception as e:
-        st.sidebar.warning(f"ニュース取得エラー: {e}")
-        return [{"title": "ニュース取得エラー", "date": "--/--"}]
+    except: return [{"title": "ニュース取得エラー", "date": "--/--"}]
 
 def check_economic_calendar(news_list):
-    """ニュースリストから重要経済指標に関連するものを抽出。"""
     danger_keywords = ["雇用統計", "CPI", "消費者物価", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
     events = []
     for news in news_list:
-        title = news["title"]
-        if any(keyword in title for keyword in danger_keywords):
-            time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', title)
-            sched_time = time_match.group(0) if time_match else "時間未定"
-            events.append({"title": title, "time": sched_time})
+        if any(kw in news["title"] for kw in danger_keywords):
+            time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', news["title"])
+            events.append({"title": news["title"], "time": time_match.group(0) if time_match else "時間未定"})
     return events
 
-def send_discord_message(text):
-    try:
-        webhook_url = st.secrets["DISCORD_WEBHOOK_URL"]
-        requests.post(webhook_url, json={"content": text})
-    except Exception as e:
-        st.sidebar.error(f"Discord通知エラー: {e}")
-
-def send_to_spreadsheet(data):
-    try:
-        gas_url = st.secrets["GAS_WEBAPP_URL"]
-        requests.post(gas_url, json=data)
-    except Exception as e:
-        st.sidebar.error(f"スプレッドシート記帳エラー: {e}")
-
 def update_github_config(side, entry, tp, sl, lots, rule_name="Rule 1"):
-    """GitHubリポジトリのconfig.jsonを更新。"""
     try:
-        token = st.secrets["GITHUB_TOKEN"]
-        repo = st.secrets["GITHUB_REPO"]
-        path = st.secrets["GITHUB_TARGET_FILE"]
+        token, repo, path = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"], st.secrets["GITHUB_TARGET_FILE"]
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-        
         res = requests.get(url, headers=headers).json()
         if "sha" not in res: return False
-        
-        content_dict = {
-            "rule_name": rule_name,
-            "side": side,
-            "entry": float(entry),
-            "tp": float(tp),
-            "sl": float(sl),
-            "lots": float(lots),
-            "status": "waiting_entry",
-            "is_active": True
-        }
+        content_dict = {"rule_name": rule_name, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl), "lots": float(lots), "status": "waiting_entry", "is_active": True}
         content_json = json.dumps(content_dict, indent=2)
-        content_base64 = base64.b64encode(content_json.encode()).decode()
-        
-        payload = {"message": f"Update {rule_name} ({side} at {entry})", "content": content_base64, "sha": res["sha"]}
-        response = requests.put(url, headers=headers, json=payload)
-        return response.status_code == 200
-    except Exception as e:
-        st.error(f"GitHub連携エラー: {e}")
-        return False
+        payload = {"message": f"Update {rule_name}", "content": base64.b64encode(content_json.encode()).decode(), "sha": res["sha"]}
+        return requests.put(url, headers=headers, json=payload).status_code == 200
+    except: return False
 
 # ==========================================
 # メイン画面構築
 # ==========================================
-st.title("🎯 釘田式・プロ仕様 FX AI指令室")
+st.title("🎯 釘田式・FX AI指令室 PRO")
 
-# カラム構成
 col1, col2, col3 = st.columns([1.2, 2.2, 1.8])
 
-# --- 左カラム：市場データ ＆ マクロ指標 ---
+# --- 左カラム：市場データ ＆ 多角分析 ---
 with col1:
-    st.subheader("📊 為替 ＆ 多角分析指標")
-    
-    chart_data, tech_vals = get_technical_chart_data("JPY=X")
-    usd_p = tech_vals.get("current", 0.0)
-    
-    st.metric("🇺🇸 ドル/円 (USD/JPY)", f"{usd_p:.3f} 円")
+    st.subheader("📊 為替 ＆ 相関資産")
+    chart_data, tech = get_technical_chart_data("JPY=X")
+    usd_p = tech.get("current", 0.0)
+    st.metric("🇺🇸 ドル/円", f"{usd_p:.3f} 円")
     
     st.write("---")
-    st.write("🌍 **機関投資家の注目データ**")
-    m_data = get_market_indicators()
-    st.metric("📈 米10年債利回り (TNX)", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
-    st.metric("📉 恐怖指数 (VIX)", f"{m_data['VIX']['val']:.2f}", f"{m_data['VIX']['diff']:.2f}")
-    st.metric("💵 ドル指数 (DXY)", f"{m_data['DXY']['val']:.2f}", f"{m_data['DXY']['diff']:.2f}")
-    
-    # 🌟 追加：相関資産の表示
-    st.write("---")
-    st.write("💹 **グローバル相関資産**")
-    st.metric("🇯🇵 日経平均株価", f"{m_data['N225']['val']:,.0f} 円", f"{m_data['N225']['diff']:,.0f}")
-    st.metric("🇺🇸 S&P500指数", f"{m_data['SPX']['val']:,.2f}", f"{m_data['SPX']['diff']:.2f}")
+    m = get_market_indicators()
+    st.metric("📈 米10年債利回り", f"{m['TNX']['val']:.2f}%", f"{m['TNX']['diff']:.3f}")
+    st.metric("💵 ドル指数(DXY)", f"{m['DXY']['val']:.2f}", f"{m['DXY']['diff']:.2f}")
+    st.metric("🇯🇵 日経平均", f"{m['N225']['val']:,.0f}", f"{m['N225']['diff']:,.0f}")
+    st.metric("🇺🇸 S&P500", f"{m['SPX']['val']:,.0f}", f"{m['SPX']['diff']:,.0f}")
+    st.metric("📉 恐怖指数(VIX)", f"{m['VIX']['val']:.2f}", f"{m['VIX']['diff']:.2f}")
     
     st.write("---")
     st.subheader("📅 重要経済指標予定")
     all_news = get_wall_street_news()
     calendar = check_economic_calendar(all_news)
-    
     if calendar:
-        for ev in calendar[:5]:
-            st.warning(f"🕒 予定時刻: {ev['time']}\n{ev['title']}")
-    else:
-        st.success("本日の主要指標予定は見当たりません。")
+        for ev in calendar[:5]: st.warning(f"🕒 {ev['time']}\n{ev['title']}")
+    else: st.success("本日の主要指標予定なし")
 
-# --- 中央カラム：自動チャート ＆ ニュース ＆ 解析 ---
+# --- 中央カラム：チャート ＆ AI解析 ---
 with col2:
-    st.subheader("📈 テクニカルチャート (1時間足 + BB)")
-    
+    st.subheader("📈 テクニカルチャート (1H + BB + SMA)")
     if chart_data is not None:
-        fig = go.Figure(data=[go.Candlestick(x=chart_data.index,
-                        open=chart_data['Open'], high=chart_data['High'],
-                        low=chart_data['Low'], close=chart_data['Close'],
-                        name='ローソク足')])
-        
+        fig = go.Figure(data=[go.Candlestick(x=chart_data.index, open=chart_data['Open'], high=chart_data['High'], low=chart_data['Low'], close=chart_data['Close'], name='Candle')])
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA20'], line=dict(color='orange', width=1.5), name='SMA20'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Upper2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB+2σ'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Lower2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB-2σ'))
-        
         fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
-        # 🌟 現在のテクニカル数値を表示（レジサポと日足トレンドを追加）
-        st.caption(f"💡 RSI(14): {tech_vals.get('rsi14', 0):.1f} | 5日高値: {tech_vals.get('high_5d'):.2f} | 5日安値: {tech_vals.get('low_5d'):.2f} | 日足SMA20: {tech_vals.get('daily_sma20'):.2f}")
-    else:
-        st.warning("チャートデータを取得できませんでした。")
+        # 🌟 進化：BB Widthの視覚化
+        status_sq = "⚠️ スクイーズ中（エネルギー蓄積）" if tech['is_squeeze'] else "🚀 ボラティリティ拡大中"
+        st.caption(f"💡 {status_sq} | BB幅: {tech['bb_width']:.4f} (平均: {tech['bb_avg_width']:.4f})")
+        st.caption(f"💡 5日高値: {tech['high_5d']:.2f} | 5日安値: {tech['low_5d']:.2f} | 日足SMA20: {tech['daily_sma20']:.2f}")
 
     st.write("---")
     st.subheader("📰 最新ニュース (30本)")
     news_text = "\n".join([f"[{n['date']}] {n['title']}" for n in all_news])
-    
-    with st.expander("ニュース・ヘッドライン（30件）を開く"):
+    with st.expander("ニュースヘッドラインを開く"):
         st.text_area("", value=news_text, height=200, label_visibility="collapsed")
     
-    if st.button("✨ 総合解析を実行（全データ注入）", use_container_width=True, type="primary"):
-        with st.spinner("AIクオンツが市場データとニュースを分析中..."):
-            
-            # 🌟 AIに渡すプロンプトに「相関資産」と「上位足トレンド」「レジサポ」を注入！
+    if st.button("✨ 総合解析を実行 (全データ注入)", use_container_width=True, type="primary"):
+        with st.spinner("AIがセッションとボラティリティを分析中..."):
+            current_session = get_market_session()
             ai_context = f"""
-            【現在の市場データ（ドル円: {usd_p:.3f}円）】
-            ▼ テクニカル指標 (1時間足)
-            ・RSI(14): {tech_vals.get('rsi14', 0):.1f}
-            ・BB上2σ: {tech_vals.get('upper2', 0):.3f}
-            ・BB下2σ: {tech_vals.get('lower2', 0):.3f}
-            ・SMA20: {tech_vals.get('sma20', 0):.3f}
-            ・直近5日間の最高値: {tech_vals.get('high_5d'):.3f}
-            ・直近5日間の最安値: {tech_vals.get('low_5d'):.3f}
-
-            ▼ 上位足トレンド (日足)
-            ・日足SMA20: {tech_vals.get('daily_sma20'):.3f}
-
-            ▼ マクロ指標 ＆ 相関資産
-            ・米国債10年利回り: {m_data['TNX']['val']:.2f}%
-            ・恐怖指数(VIX): {m_data['VIX']['val']:.2f}
-            ・ドルインデックス(DXY): {m_data['DXY']['val']:.2f}
-            ・日経平均株価: {m_data['N225']['val']:,.0f}円
-            ・S&P500指数: {m_data['SPX']['val']:,.0f}
+            【市場セッション】{current_session}
+            【ボラティリティ】BB幅:{tech['bb_width']:.4f}, 平均幅:{tech['bb_avg_width']:.4f}, 判定:{'スクイーズ(収束)' if tech['is_squeeze'] else 'エクスパンション(拡散)'}
+            【短期足(1H)】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI:{tech['rsi14']:.1f}
+            【長期足(日足)】日足SMA20:{tech['daily_sma20']:.3f}, 5日高値:{tech['high_5d']:.3f}, 5日安値:{tech['low_5d']:.3f}
+            【外部環境】米10年債:{m['TNX']['val']:.2f}%, ドル指数:{m['DXY']['val']:.2f}, 日経平均:{m['N225']['val']:,.0f}, SP500:{m['SPX']['val']:,.0f}, VIX:{m['VIX']['val']:.2f}
             """
-            
-            prompt = f"以下の【市場データ】と【ニュース30件】を総合的に判断し、上位足のトレンドと相関資産（株価）の動きを考慮した、本日のデイトレ戦略（環境認識、売り買いの方向、具体的な目標価格）をプロのトレーダーとして解説してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
+            prompt = f"以下の【市場データ】と【ニュース】を元に、現在の市場セッションとボラティリティ（スクイーズ状態か）を考慮した最強の戦略を立ててください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
             
             response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
             
-            json_prompt = f"""
-            現在のドル円価格は {usd_p:.3f} 円です。
-            以下の【あなたが作成した戦略】を正確に読み取り、監視すべき数値をJSON形式のみで出力してください。
-
-            【あなたが作成した戦略】
-            {st.session_state.strategy_result}
-
-            出力例: {{"side": "sell", "entry": 150.10, "tp": 149.50, "sl": 150.50}}
-            """
+            json_prompt = f"現在の価格{usd_p}円を基準に、以下から {{'side': 'buy'or'sell', 'entry': 数値, 'tp': 数値, 'sl': 数値}} のJSONのみ出力せよ。\n\n{st.session_state.strategy_result}"
             json_res = model.generate_content(json_prompt).text
             match = re.search(r'\{.*\}', json_res, re.DOTALL)
-            if match:
-                st.session_state.target_prices = json.loads(match.group())
+            if match: st.session_state.target_prices = json.loads(match.group())
 
 # --- 右カラム：戦略 ＆ 資金管理 ---
 with col3:
-    st.subheader("💡 今日のAI戦略 (Rule 1)")
+    st.subheader("💡 AI特化型戦略 (Rule 1)")
     if st.session_state.strategy_result:
-        
-        with st.container(height=350):
-            st.info(st.session_state.strategy_result)
-        
+        with st.container(height=350): st.info(st.session_state.strategy_result)
         if st.session_state.target_prices:
-            tp_data = st.session_state.target_prices
-            st.write("---")
-            st.subheader("🛡️ 資金管理設定")
-            
-            risk_cash = st.number_input("1トレードの許容損失額 (円)", value=10000, step=1000)
-            
-            side_index = 0 if tp_data.get('side', 'buy') == 'buy' else 1
-            side = st.selectbox("売買方向", ["buy", "sell"], index=side_index)
-            
-            t_entry = st.number_input("エントリー価格", value=float(tp_data['entry']), step=0.01)
-            t_tp = st.number_input("利確目標 (TP)", value=float(tp_data['tp']), step=0.01)
-            t_sl = st.number_input("損切ライン (SL)", value=float(tp_data['sl']), step=0.01)
-            
-            pips_risk = abs(t_entry - t_sl)
-            calc_lots = round(risk_cash / (pips_risk * 10000), 2) if pips_risk > 0 else 0.0
-            
-            st.metric("💡 推奨ロット数", f"{calc_lots} ロット")
+            tp_d = st.session_state.target_prices
+            risk = st.number_input("許容損失額 (円)", value=10000, step=1000)
+            side = st.selectbox("売買方向", ["buy", "sell"], index=0 if tp_d['side']=='buy' else 1)
+            t_ent = st.number_input("Entry", value=float(tp_d['entry']), step=0.01)
+            t_tp = st.number_input("TP", value=float(tp_d['tp']), step=0.01)
+            t_sl = st.number_input("SL", value=float(tp_d['sl']), step=0.01)
+            lots = round(risk / (abs(t_ent - t_sl) * 10000), 2) if abs(t_ent - t_sl) > 0 else 0.0
+            st.metric("💡 推奨ロット", f"{lots} ロット")
 
-            if st.button("🚀 Rule 1 で監視予約を実行", use_container_width=True, type="primary"):
-                # Rule 1 として保存
-                if update_github_config(side, t_entry, t_tp, t_sl, calc_lots, "Rule 1"):
-                    
-                    log_data = {
-                        "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
-                        "rule": "1",
-                        "side": "買い" if side == "buy" else "売り",
-                        "entry": t_entry,
-                        "exit": 0,
-                        "result": "待機中",
-                        "pnl": 0,
-                        "lots": calc_lots
-                    }
-                    send_to_spreadsheet(log_data)
-                    
-                    msg = f"🎯 【Rule 1 予約確定】\n方向: {side} / ロット: {calc_lots}\nエントリー: {t_entry}円\n利確: {t_tp}円 / 損切: {t_sl}円"
-                    send_discord_message(msg)
-                    
-                    st.success("Rule 1 予約完了！ GitHub同期 ＆ Discord通知を送信しました。")
-    else:
-        st.write("「総合解析を実行」ボタンを押すと、戦略が表示されます。")
+            if st.button("🚀 24時間監視予約を実行", use_container_width=True, type="primary"):
+                if update_github_config(side, t_ent, t_tp, t_sl, lots, "Rule 1"):
+                    requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%Y-%m-%d %H:%M'), "rule": "1", "side": "買い" if side == "buy" else "売り", "entry": t_ent, "exit": 0, "result": "待機中", "pnl": 0, "lots": lots})
+                    requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\nセッション: {get_market_session()}\n方向: {side} / ロット: {lots}\nEntry: {t_ent}円 / TP: {t_tp}円 / SL: {t_sl}"})
+                    st.success("Rule 1 予約完了！")
