@@ -6,12 +6,14 @@ import xml.etree.ElementTree as ET
 import email.utils
 import google.generativeai as genai
 from datetime import datetime
+from PIL import Image
 import requests
 import json
 import re
 import base64
 import plotly.graph_objects as go
 
+# --- 0. 初期設定 ---
 st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室", layout="wide")
 
 try:
@@ -19,7 +21,7 @@ try:
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
 except Exception as e:
-    st.error("API設定を確認してください。")
+    st.error("API設定（GOOGLE_API_KEY）を確認してください。")
     st.stop()
 
 if "strategy_result" not in st.session_state:
@@ -27,34 +29,63 @@ if "strategy_result" not in st.session_state:
 if "target_prices" not in st.session_state:
     st.session_state.target_prices = None
 
+# --- 1. 共通関数群 ---
+
 def get_market_indicators():
+    """ドル指数(DXY)を含む3大指標（TNX, VIX, DXY）を正確に取得。"""
     results = {}
-    for k, t in {"TNX": "^TNX", "VIX": "^VIX", "DXY": "DX-Y.NYB"}.items():
+    try:
+        data = yf.Ticker("^TNX").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["TNX"] = {"val": c, "diff": c - p}
+        else: results["TNX"] = {"val": 0.0, "diff": 0.0}
+    except: results["TNX"] = {"val": 0.0, "diff": 0.0}
+    
+    try:
+        data = yf.Ticker("^VIX").history(period="5d")
+        if not data.empty and len(data) >= 2:
+            c = float(data['Close'].iloc[-1]); p = float(data['Close'].iloc[-2])
+            results["VIX"] = {"val": c, "diff": c - p}
+        else: results["VIX"] = {"val": 0.0, "diff": 0.0}
+    except: results["VIX"] = {"val": 0.0, "diff": 0.0}
+    
+    dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
+    results["DXY"] = {"val": 0.0, "diff": 0.0}
+    for t in dxy_tickers:
         try:
             data = yf.Ticker(t).history(period="5d")
-            c, p = float(data['Close'].iloc[-1]), float(data['Close'].iloc[-2])
-            results[k] = {"val": c, "diff": c - p}
-        except: results[k] = {"val": 0.0, "diff": 0.0}
+            if not data.empty and len(data) >= 2:
+                c = float(data['Close'].iloc[-1]), float(data['Close'].iloc[-2])
+                if t == "UUP": c = [val * 3.5 for val in c] # UUP補正
+                results["DXY"] = {"val": c[0], "diff": c[0] - c[1]}
+                break
+        except: continue
     return results
 
 def get_technical_chart_data(ticker="JPY=X"):
+    """チャートデータとボリンジャーバンド指標計算。"""
     try:
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
-        if isinstance(data.columns, pd.MultiIndex): data.columns = [col[0] for col in data.columns]
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
         close = data['Close']
-        data['SMA20'] = close.rolling(20).mean()
-        std = close.rolling(20).std()
+        data['SMA20'] = close.rolling(window=20).mean()
+        data['SMA50'] = close.rolling(window=50).mean()
+        std = close.rolling(window=20).std()
         data['Upper2'] = data['SMA20'] + (std * 2)
         data['Lower2'] = data['SMA20'] - (std * 2)
         delta = close.diff()
         gain, loss = delta.clip(lower=0).rolling(14).mean(), -delta.clip(upper=0).rolling(14).mean()
         data['RSI14'] = 100 - (100 / (1 + (gain / loss)))
         latest = data.iloc[-1]
-        return data, {"current": float(latest['Close']), "upper2": float(latest['Upper2']), "lower2": float(latest['Lower2']), "rsi14": float(latest['RSI14'])}
+        tech = {"current": float(latest['Close']), "sma20": float(latest['SMA20']), "upper2": float(latest['Upper2']), "lower2": float(latest['Lower2']), "rsi14": float(latest['RSI14'])}
+        return data, tech
     except: return None, {}
 
 def get_wall_street_news():
+    """国内・海外・ビジネスの3系統からニュースを30件取得。"""
     urls = ["https://news.yahoo.co.jp/rss/categories/business.xml", "https://news.yahoo.co.jp/rss/categories/world.xml", "https://news.yahoo.co.jp/rss/topics/business.xml"]
     news_list = []
     seen = set()
@@ -67,9 +98,25 @@ def get_wall_street_news():
                 title = item.find('title').text
                 if title not in seen:
                     seen.add(title)
-                    news_list.append({"title": title, "date": "最新"})
-        return news_list[:30]
+                    pub_date_str = item.find('pubDate').text
+                    try:
+                        dt = email.utils.parsedate_to_datetime(pub_date_str)
+                        date_formatted = dt.astimezone().strftime("%m/%d %H:%M")
+                    except: date_formatted = "不明"
+                    news_list.append({"title": title, "date": date_formatted})
+                if len(news_list) >= 30: return news_list
+        return news_list
     except: return []
+
+def check_economic_calendar(news_list):
+    """ニュースから重要経済指標をフィルタリング。"""
+    danger_keywords = ["雇用統計", "CPI", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
+    events = []
+    for news in news_list:
+        if any(keyword in news["title"] for keyword in danger_keywords):
+            time_match = re.search(r'(\d{1,2}:\d{2})|(\d{1,2}時)', news["title"])
+            events.append({"title": news["title"], "time": time_match.group(0) if time_match else "時間未定"})
+    return events
 
 def update_github_config(side, entry, tp, sl, lots, rule_name="Rule 1"):
     try:
@@ -86,14 +133,19 @@ def update_github_config(side, entry, tp, sl, lots, rule_name="Rule 1"):
 col1, col2, col3 = st.columns([1.2, 2.2, 1.8])
 
 with col1:
-    st.subheader("📊 為替 ＆ 市場指標")
+    st.subheader("📊 為替 ＆ 指標")
     chart_data, tech = get_technical_chart_data("JPY=X")
     usd_p = tech.get("current", 0.0)
     st.metric("🇺🇸 ドル/円", f"{usd_p:.3f} 円")
-    m = get_market_indicators()
-    st.metric("📈 米10年債利回り", f"{m['TNX']['val']:.2f}%", f"{m['TNX']['diff']:.3f}")
-    st.metric("📉 恐怖指数 (VIX)", f"{m['VIX']['val']:.2f}", f"{m['VIX']['diff']:.2f}")
-    st.metric("💵 ドル指数 (DXY)", f"{m['DXY']['val']:.2f}", f"{m['DXY']['diff']:.2f}")
+    st.write("---")
+    m_data = get_market_indicators()
+    st.metric("📈 米10年債利回り", f"{m_data['TNX']['val']:.2f}%", f"{m_data['TNX']['diff']:.3f}")
+    st.metric("📉 恐怖指数 (VIX)", f"{m_data['VIX']['val']:.2f}", f"{m_data['VIX']['diff']:.2f}")
+    st.metric("💵 ドル指数 (DXY)", f"{m_data['DXY']['val']:.2f}", f"{m_data['DXY']['diff']:.2f}")
+    st.write("---")
+    all_news = get_wall_street_news()
+    calendar = check_economic_calendar(all_news)
+    for ev in calendar[:5]: st.warning(f"🕒 {ev['time']}: {ev['title']}")
 
 with col2:
     st.subheader("📈 チャート (1H + BB)")
@@ -106,15 +158,16 @@ with col2:
     
     if st.button("✨ 総合解析を実行", use_container_width=True, type="primary"):
         with st.spinner("AIクオンツ解析中..."):
-            news = get_wall_street_news()
-            prompt = f"USD/JPY:{usd_p}, RSI:{tech['rsi14']}, BB上:{tech['upper2']}, BB下:{tech['lower2']}。戦略を立てよ。ニュース：\n" + "\n".join([n['title'] for n in news])
+            news_txt = "\n".join([n['title'] for n in all_news])
+            ai_context = f"USD/JPY:{usd_p}, RSI:{tech['rsi14']}, BB上:{tech['upper2']}, BB下:{tech['lower2']}, TNX:{m_data['TNX']['val']:.2f}, VIX:{m_data['VIX']['val']:.2f}, DXY:{m_data['DXY']['val']:.2f}"
+            prompt = f"以下の市場環境とニュースを元に、戦略を立ててください。\n\n{ai_context}\n\n【ニュース】\n{news_txt}"
             st.session_state.strategy_result = model.generate_content(prompt).text
             json_res = model.generate_content(f"{st.session_state.strategy_result}\n上記から {{'side': 'buy'or'sell', 'entry':数値, 'tp':数値, 'sl':数値}} のJSONのみ出せ").text
             match = re.search(r'\{.*\}', json_res, re.DOTALL)
             if match: st.session_state.target_prices = json.loads(match.group())
 
 with col3:
-    st.subheader("💡 今日のAI戦略 (Rule 1)")
+    st.subheader("💡 AI戦略 (Rule 1)")
     if st.session_state.strategy_result:
         with st.container(height=350): st.info(st.session_state.strategy_result)
         if st.session_state.target_prices:
@@ -126,6 +179,6 @@ with col3:
             st.metric("推奨ロット", f"{lots} ロット")
             if st.button("🚀 Rule 1 で監視予約", use_container_width=True, type="primary"):
                 if update_github_config(side, ent, t_tp, t_sl, lots, "Rule 1"):
-                    requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\n方向: {side} / ロット: {lots}\nEntry: {ent} / TP: {t_tp} / SL: {t_sl}"})
-                    requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%m/%d %H:%M'), "side": side, "entry": ent, "lots": lots, "result": "待機中(Rule 1)"})
+                    requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\nロット: {lots}\nEntry: {ent} / TP: {t_tp} / SL: {t_sl}"})
+                    requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%m/%d %H:%M'), "side": f"Rule 1({side})", "entry": ent, "lots": lots, "result": "待機中"})
                     st.success("Rule 1 予約完了！")
