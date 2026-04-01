@@ -30,7 +30,7 @@ def check_price():
     sha, config = res["sha"], json.loads(base64.b64decode(res["content"]).decode('utf-8'))
     if not config.get("is_active"): return
 
-    rule_name = config.get("rule_name", "Unknown Rule")
+    rule_name = config.get("rule_name", "Unknown")
     side, status = config.get("side", "buy"), config.get("status", "waiting_entry")
     entry, tp, sl, lots = config["entry"], config["tp"], config["sl"], config.get("lots", 0.0)
 
@@ -39,14 +39,15 @@ def check_price():
         current_p = float(data['Close'].iloc[-1])
     except: return
 
-    # --- エントリー通知 ---
+    # --- 1. 入口通知 ---
     if status == "waiting_entry":
-        if (side == "buy" and current_p <= entry + 0.02) or (side == "sell" and current_p >= entry - 0.02):
-            send_discord(f"🔔 【{rule_name} エントリー】\n方向: {side} / ロット: {lots}\n現在価格がターゲット({entry})に到達しました。")
+        is_hit = (side == "buy" and current_p <= entry + 0.02) or (side == "sell" and current_p >= entry - 0.02)
+        if is_hit:
+            send_discord(f"🔔 【{rule_name} エントリー】\n価格が到達しました。監視を決済フェーズに移行します。\n現在値: {current_p:.3f}")
             config["status"] = "holding"
             update_config_status(config, sha)
 
-    # --- 決済通知 ---
+    # --- 2. 出口通知 ＆ 終了 ---
     elif status == "holding":
         is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
         is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
@@ -55,19 +56,9 @@ def check_price():
             pnl = int((exit_p - entry) * lots * 10000) if side == "buy" else int((entry - exit_p) * lots * 10000)
             res_txt = "利確 🎉" if is_win else "損切り 😢"
             
-            send_discord(f"{'💰' if is_win else '⚠️'} 【{rule_name} 決済完了】\n結果: {res_txt}\n損益: {pnl:,}円\n次のトレードまで待機します。")
+            send_discord(f"{'💰' if is_win else '⚠️'} 【{rule_name} 決済完了】\n結果: {res_txt}\n損益: {pnl:,}円\n監視を終了します。")
+            send_to_spreadsheet({"date": datetime.now().strftime('%m/%d %H:%M'), "side": f"{rule_name}({side})", "entry": entry, "exit": exit_p, "result": res_txt, "pnl": pnl, "lots": lots})
             
-            send_to_spreadsheet({
-                "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
-                "side": f"{rule_name}({side})",
-                "entry": entry,
-                "exit": exit_p,
-                "result": res_txt,
-                "pnl": pnl,
-                "lots": lots
-            })
-            
-            # 監視をオフにし、ステータスを完了にする
             config["is_active"] = False
             config["status"] = "done"
             update_config_status(config, sha)
