@@ -33,7 +33,7 @@ if "target_prices" not in st.session_state:
 # --- 1. 共通関数群 ---
 
 def get_market_indicators():
-    """ウォール街が重視する3大指標（TNX, VIX, DXY）を取得。"""
+    """ドル指数(DXY)を含む3大指標（TNX, VIX, DXY）を取得。"""
     results = {}
     # 米10年債利回り
     try:
@@ -53,7 +53,7 @@ def get_market_indicators():
         else: results["VIX"] = {"val": 0.0, "diff": 0.0}
     except: results["VIX"] = {"val": 0.0, "diff": 0.0}
     
-    # ドル指数 (DXY) - 複数のティッカーで安定取得を試行
+    # ドル指数 (DXY) - 複数のティッカーで安定取得
     dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
     results["DXY"] = {"val": 0.0, "diff": 0.0}
     for t in dxy_tickers:
@@ -68,7 +68,7 @@ def get_market_indicators():
     return results
 
 def get_technical_chart_data(ticker="JPY=X"):
-    """1時間足のデータを取得し、SMA、RSI、ボリンジャーバンドを計算。"""
+    """チャートデータとボリンジャーバンド指標計算。"""
     try:
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
@@ -88,8 +88,7 @@ def get_technical_chart_data(ticker="JPY=X"):
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(window=14).mean()
         loss = -1 * delta.clip(upper=0).rolling(window=14).mean()
-        rs = gain / loss
-        data['RSI14'] = 100 - (100 / (1 + rs))
+        data['RSI14'] = 100 - (100 / (1 + (gain / loss)))
         
         latest = data.iloc[-1]
         latest_tech = {
@@ -216,7 +215,7 @@ with col1:
     else:
         st.success("本日の主要指標予定なし。")
 
-# --- 中央カラム：チャート ＆ ニュース ＆ 解析 ---
+# --- 中央カラム：チャート ＆ 解析 ---
 with col2:
     st.subheader("📈 チャート (1H + ボリンジャーバンド)")
     if chart_data is not None:
@@ -225,7 +224,6 @@ with col2:
                         low=chart_data['Low'], close=chart_data['Close'],
                         name='ローソク足')])
         
-        # 指標の追加
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA20'], line=dict(color='orange', width=1.5), name='SMA20'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Upper2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB+2σ'))
         fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Lower2'], line=dict(color='rgba(173,216,230,0.6)', dash='dash'), name='BB-2σ'))
@@ -244,14 +242,15 @@ with col2:
         with st.spinner("AIクオンツが市場とニュースを分析中..."):
             ai_context = f"""
             現在価格:{usd_p:.3f}, RSI:{tech_vals['rsi14']:.1f}, BB上:{tech_vals['upper2']:.3f}, BB下:{tech_vals['lower2']:.3f},
-            米10年債:{m_data['TNX']['val']:.2f}%, VIX:{m_data['VIX']['val']:.2f}, DXY:{m_data['DXY']['val']:.2f}
+            米10年債:{m_data['TNX']['val']:.2f}%, VIX:{m_data['VIX']['val']:.2f}
             """
             prompt = f"以下の市場環境とニュースを元に、BBの収束・拡散を考慮したデイトレ戦略を立て、entry/tp/slの数値を出してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
             
             response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
             
-            json_res = model.generate_content(f"{st.session_state.strategy_result}\n上記から {{'side': 'buy'or'sell', 'entry': 数値, 'tp': 数値, 'sl': 数値}} のJSONのみ出力せよ。").text
+            json_prompt = f"現在の価格{usd_p}円を基準に、以下から {{'side': 'buy'or'sell', 'entry': 数値, 'tp': 数値, 'sl': 数値}} のJSONのみ出力せよ。\n\n{st.session_state.strategy_result}"
+            json_res = model.generate_content(json_prompt).text
             match = re.search(r'\{.*\}', json_res, re.DOTALL)
             if match:
                 st.session_state.target_prices = json.loads(match.group())
@@ -280,5 +279,10 @@ with col3:
             if st.button("🚀 24時間監視予約", use_container_width=True, type="primary"):
                 if update_github_config(side, t_entry, t_tp, t_sl, calc_lots):
                     send_to_spreadsheet({"date": datetime.now().strftime('%m/%d %H:%M'), "side": side, "entry": t_entry, "lots": calc_lots, "result": "待機中"})
-                    send_discord_message(f"🎯 予約確定: {side} @ {t_entry}\nTP: {t_tp} / SL: {t_sl}")
-                    st.success("GitHub同期完了！")
+                    # 🌟 ロット数をDiscord通知に追加！
+                    msg = (f"🎯 【予約確定】\n"
+                           f"方向: {side} / ロット: {calc_lots}\n"
+                           f"エントリー: {t_entry}円\n"
+                           f"利確: {t_tp}円 / 損切: {t_sl}円")
+                    send_discord_message(msg)
+                    st.success("GitHub同期完了 ＆ Discord通知送信！")
