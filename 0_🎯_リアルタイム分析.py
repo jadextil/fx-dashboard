@@ -20,11 +20,13 @@ st.set_page_config(page_title="⛩️ 釘田式・FX AI指令室 PRO", layout="w
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
+    # ユーザー様の環境で動作実績のあるバージョンを指定
     model = genai.GenerativeModel('gemini-2.5-flash')
 except Exception as e:
     st.error("API設定（GOOGLE_API_KEY）を確認してください。")
     st.stop()
 
+# セッション状態の初期化
 if "strategy_result" not in st.session_state:
     st.session_state.strategy_result = ""
 if "target_prices" not in st.session_state:
@@ -33,21 +35,18 @@ if "target_prices" not in st.session_state:
 # --- 1. 共通関数群 ---
 
 def get_market_session():
-    """現在の時刻から、主要な市場セッションを判定する。"""
-    # 日本時間を基準にする
+    """現在の時刻から、東京・ロンドン・NYのどのセッションかを判定する。"""
     jst = pytz.timezone('Asia/Tokyo')
     now = datetime.now(jst).time()
-    
     sessions = []
     if time(9, 0) <= now <= time(15, 0): sessions.append("東京市場 (Tokyo)")
     if time(16, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(1, 0): sessions.append("ロンドン市場 (London)")
     if time(21, 0) <= now <= time(24, 0) or time(0, 0) <= now <= time(6, 0): sessions.append("ニューヨーク市場 (NY)")
-    
     if not sessions: sessions.append("オセアニア/時間外 (Quiet Time)")
     return " & ".join(sessions)
 
 def get_market_indicators():
-    """マクロ指標（TNX, VIX, DXY）および相関資産（N225, SPX）を取得。"""
+    """マクロ指標（TNX, VIX, DXY）および相関資産（N225, SPX）を正確に取得。"""
     results = {}
     targets = {"TNX": "^TNX", "VIX": "^VIX", "N225": "^N225", "SPX": "^GSPC"}
     
@@ -60,6 +59,7 @@ def get_market_indicators():
             else: results[key] = {"val": 0.0, "diff": 0.0}
         except: results[key] = {"val": 0.0, "diff": 0.0}
     
+    # ドル指数 (DXY) の多重取得
     dxy_tickers = ["DX-Y.NYB", "DX=F", "UUP"]
     results["DXY"] = {"val": 0.0, "diff": 0.0}
     for t in dxy_tickers:
@@ -74,36 +74,41 @@ def get_market_indicators():
     return results
 
 def get_technical_chart_data(ticker="JPY=X"):
-    """短期・長期の指標、BB Width（スクイーズ）、レジサポを精密計算。"""
+    """SMA, BB, RSI, BB Width, レジサポ, 日足トレンドをすべて計算。"""
     try:
+        # 短期分析用（1時間足）
         data = yf.download(ticker, period="10d", interval="1h", progress=False)
         if data.empty: return None, {}
         if isinstance(data.columns, pd.MultiIndex): data.columns = [col[0] for col in data.columns]
             
         close = data['Close']
+        # SMA計算
         data['SMA20'] = close.rolling(window=20).mean()
         data['SMA50'] = close.rolling(window=50).mean()
+        
+        # ボリンジャーバンド計算
         std = close.rolling(window=20).std()
         data['Upper2'] = data['SMA20'] + (std * 2)
         data['Lower2'] = data['SMA20'] - (std * 2)
         
-        # 🌟 進化：ボリンジャーバンド幅 (BB Width) の計算
-        # 計算式: (Upper - Lower) / Middle
-        data['BB_Width'] = (data['Upper2'] - data['Lower2']) / data['SMA20']
-        avg_width = data['BB_Width'].tail(100).mean() # 過去100時間の平均幅
-        current_width = data['BB_Width'].iloc[-1]
+        # 🌟 RSI(14) の計算（復活・明示）
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(window=14).mean()
+        loss = -delta.clip(upper=0).rolling(window=14).mean()
+        data['RSI14'] = 100 - (100 / (1 + (gain / loss)))
         
-        # スクイーズ判定（平均より20%以上狭ければスクイーズ）
+        # BB Width（スクイーズ判定用）
+        data['BB_Width'] = (data['Upper2'] - data['Lower2']) / data['SMA20']
+        avg_width = data['BB_Width'].tail(100).mean()
+        current_width = data['BB_Width'].iloc[-1]
         is_squeeze = current_width < (avg_width * 0.8)
         
-        delta = close.diff()
-        gain, loss = delta.clip(lower=0).rolling(14).mean(), -delta.clip(upper=0).rolling(14).mean()
-        data['RSI14'] = 100 - (100 / (1 + (gain / loss)))
-
+        # 上位足（日足）トレンド
         data_daily = yf.download(ticker, period="3mo", interval="1d", progress=False)
         if isinstance(data_daily.columns, pd.MultiIndex): data_daily.columns = [col[0] for col in data_daily.columns]
         daily_sma20 = data_daily['Close'].rolling(window=20).mean().iloc[-1]
         
+        # 5日レジサポ
         high_5d = float(data['High'].tail(120).max())
         low_5d = float(data['Low'].tail(120).min())
         
@@ -114,7 +119,7 @@ def get_technical_chart_data(ticker="JPY=X"):
             "sma50": float(latest['SMA50']),
             "upper2": float(latest['Upper2']),
             "lower2": float(latest['Lower2']),
-            "rsi14": float(latest['RSI14']),
+            "rsi14": float(latest['RSI14']), # 🌟 RSIを辞書に格納
             "bb_width": float(current_width),
             "bb_avg_width": float(avg_width),
             "is_squeeze": is_squeeze,
@@ -128,7 +133,12 @@ def get_technical_chart_data(ticker="JPY=X"):
         return None, {}
 
 def get_wall_street_news():
-    urls = ["https://news.yahoo.co.jp/rss/categories/business.xml", "https://news.yahoo.co.jp/rss/categories/world.xml", "https://news.yahoo.co.jp/rss/topics/business.xml"]
+    """3つのRSSソースから最新ニュースを30件取得。"""
+    urls = [
+        "https://news.yahoo.co.jp/rss/categories/business.xml",
+        "https://news.yahoo.co.jp/rss/categories/world.xml",
+        "https://news.yahoo.co.jp/rss/topics/business.xml"
+    ]
     news_list = []
     seen_titles = set()
     try:
@@ -151,6 +161,7 @@ def get_wall_street_news():
     except: return [{"title": "ニュース取得エラー", "date": "--/--"}]
 
 def check_economic_calendar(news_list):
+    """ニュースから重要キーワードを検出し指標予定を抽出。"""
     danger_keywords = ["雇用統計", "CPI", "消費者物価", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
     events = []
     for news in news_list:
@@ -160,6 +171,7 @@ def check_economic_calendar(news_list):
     return events
 
 def update_github_config(side, entry, tp, sl, lots, rule_name="Rule 1"):
+    """GitHubリポジトリのconfig.jsonを更新。"""
     try:
         token, repo, path = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"], st.secrets["GITHUB_TARGET_FILE"]
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -213,9 +225,9 @@ with col2:
         fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
-        # 🌟 進化：BB Widthの視覚化
-        status_sq = "⚠️ スクイーズ中（エネルギー蓄積）" if tech['is_squeeze'] else "🚀 ボラティリティ拡大中"
-        st.caption(f"💡 {status_sq} | BB幅: {tech['bb_width']:.4f} (平均: {tech['bb_avg_width']:.4f})")
+        # 🌟 RSIを含むテクニカル情報の可視化
+        status_sq = "⚠️ スクイーズ中" if tech['is_squeeze'] else "🚀 ボラ拡大中"
+        st.caption(f"💡 {status_sq} | BB幅: {tech['bb_width']:.4f} | RSI(14): {tech['rsi14']:.1f}")
         st.caption(f"💡 5日高値: {tech['high_5d']:.2f} | 5日安値: {tech['low_5d']:.2f} | 日足SMA20: {tech['daily_sma20']:.2f}")
 
     st.write("---")
@@ -225,16 +237,17 @@ with col2:
         st.text_area("", value=news_text, height=200, label_visibility="collapsed")
     
     if st.button("✨ 総合解析を実行 (全データ注入)", use_container_width=True, type="primary"):
-        with st.spinner("AIがセッションとボラティリティを分析中..."):
+        with st.spinner("AIが全指標を精密分析中..."):
             current_session = get_market_session()
+            # 🌟 RSIを含む全コンテキストをAIに注入
             ai_context = f"""
             【市場セッション】{current_session}
-            【ボラティリティ】BB幅:{tech['bb_width']:.4f}, 平均幅:{tech['bb_avg_width']:.4f}, 判定:{'スクイーズ(収束)' if tech['is_squeeze'] else 'エクスパンション(拡散)'}
-            【短期足(1H)】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI:{tech['rsi14']:.1f}
+            【短期足(1H)】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI(14):{tech['rsi14']:.1f}
+            【ボラティリティ】BB幅:{tech['bb_width']:.4f}, 平均幅:{tech['bb_avg_width']:.4f}, 状態:{'スクイーズ' if tech['is_squeeze'] else 'エクスパンション'}
             【長期足(日足)】日足SMA20:{tech['daily_sma20']:.3f}, 5日高値:{tech['high_5d']:.3f}, 5日安値:{tech['low_5d']:.3f}
             【外部環境】米10年債:{m['TNX']['val']:.2f}%, ドル指数:{m['DXY']['val']:.2f}, 日経平均:{m['N225']['val']:,.0f}, SP500:{m['SPX']['val']:,.0f}, VIX:{m['VIX']['val']:.2f}
             """
-            prompt = f"以下の【市場データ】と【ニュース】を元に、現在の市場セッションとボラティリティ（スクイーズ状態か）を考慮した最強の戦略を立ててください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
+            prompt = f"以下の【市場データ】と【ニュース】を元に、RSIの過熱感、BBのスクイーズ、上位足トレンドを考慮した最強の戦略を立て、具体的な価格を出してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
             
             response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
@@ -254,13 +267,14 @@ with col3:
             risk = st.number_input("許容損失額 (円)", value=10000, step=1000)
             side = st.selectbox("売買方向", ["buy", "sell"], index=0 if tp_d['side']=='buy' else 1)
             t_ent = st.number_input("Entry", value=float(tp_d['entry']), step=0.01)
-            t_tp = st.number_input("TP", value=float(tp_d['tp']), step=0.01)
-            t_sl = st.number_input("SL", value=float(tp_d['sl']), step=0.01)
+            t_tp = st.number_input("TP (利確)", value=float(tp_d['tp']), step=0.01)
+            t_sl = st.number_input("SL (損切)", value=float(tp_d['sl']), step=0.01)
             lots = round(risk / (abs(t_ent - t_sl) * 10000), 2) if abs(t_ent - t_sl) > 0 else 0.0
             st.metric("💡 推奨ロット", f"{lots} ロット")
 
             if st.button("🚀 24時間監視予約を実行", use_container_width=True, type="primary"):
                 if update_github_config(side, t_ent, t_tp, t_sl, lots, "Rule 1"):
+                    # GASとDiscordへ通知
                     requests.post(st.secrets["GAS_WEBAPP_URL"], json={"date": datetime.now().strftime('%Y-%m-%d %H:%M'), "rule": "1", "side": "買い" if side == "buy" else "売り", "entry": t_ent, "exit": 0, "result": "待機中", "pnl": 0, "lots": lots})
-                    requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\nセッション: {get_market_session()}\n方向: {side} / ロット: {lots}\nEntry: {t_ent}円 / TP: {t_tp}円 / SL: {t_sl}"})
+                    requests.post(st.secrets["DISCORD_WEBHOOK_URL"], json={"content": f"🎯 【Rule 1 予約確定】\nセッション: {get_market_session()}\nRSI: {tech['rsi14']:.1f}\n方向: {side} / ロット: {lots}\nEntry: {t_ent}円 / TP: {t_tp}円 / SL: {t_sl}"})
                     st.success("Rule 1 予約完了！")
