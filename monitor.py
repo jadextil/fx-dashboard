@@ -3,7 +3,40 @@ import requests
 import os
 import json
 import base64
-from datetime import datetime
+from datetime import datetime, time
+import urllib.request
+import xml.etree.ElementTree as ET
+import re
+
+def is_danger_zone():
+    """現在時刻が重要指標発表の前後1時間以内か判定する"""
+    try:
+        url = "https://news.yahoo.co.jp/rss/categories/business.xml"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            root = ET.fromstring(response.read())
+        
+        danger_keywords = ["雇用統計", "CPI", "消費者物価", "政策金利", "FOMC", "日銀", "FRB", "パウエル"]
+        events = []
+        for item in root.findall('./channel/item'):
+            title = item.find('title').text
+            if any(kw in title for kw in danger_keywords):
+                time_match = re.search(r'(\d{1,2}):(\d{2})', title)
+                if time_match:
+                    events.append((int(time_match.group(1)), int(time_match.group(2))))
+        
+        now = datetime.now()
+        now_mins = now.hour * 60 + now.minute
+        for hr, mn in events:
+            ev_mins = hr * 60 + mn
+            # 日をまたぐケースもある程度カバー（絶対値）
+            if abs(now_mins - ev_mins) <= 60 or abs(now_mins - (ev_mins + 1440)) <= 60 or abs((now_mins + 1440) - ev_mins) <= 60:
+                return True
+        return False
+    except Exception as e:
+        print(f"Danger zone check error: {e}")
+        return False
+
 
 # GitHub Secrets から環境変数を取得
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -93,6 +126,11 @@ def check_price():
 
     # --- A. エントリー判定 ---
     if status == "waiting_entry":
+        # 経済指標フィルター（危険時間帯ならエントリーを見送る）
+        if is_danger_zone():
+            print("Economic Event Danger Zone: Skipping entry check.")
+            return
+
         is_hit = False
         if side == "buy" and current_p <= entry + 0.02: is_hit = True
         if side == "sell" and current_p >= entry - 0.02: is_hit = True
@@ -108,8 +146,21 @@ def check_price():
             config["status"] = "holding"
             update_config_status(config, sha)
 
-    # --- B. 決済判定 (利確・損切り) ---
+    # --- B. 決済判定 (利確・損切り・トレーリングストップ) ---
     elif status == "holding":
+        # トレーリングストップ（建値ストップ）の判定
+        trail_active = config.get("trail_active", False)
+        if not trail_active:
+            # 利益が50%進んだらSLを建値に移動
+            half_p = entry + (tp - entry) / 2
+            hit_half = (side == "buy" and current_p >= half_p) or (side == "sell" and current_p <= half_p)
+            if hit_half:
+                config["sl"] = entry  # SLをエントリー価格に変更
+                config["trail_active"] = True
+                send_discord(f"🛡️ 【{rule_name} 建値ストップ発動】\n価格が進捗しました。SLを建値({entry:.3f})に移動し、負けをなくしました。")
+                update_config_status(config, sha)
+                return
+
         is_win = (side == "buy" and current_p >= tp) or (side == "sell" and current_p <= tp)
         is_lose = (side == "buy" and current_p <= sl) or (side == "sell" and current_p >= sl)
 

@@ -124,6 +124,19 @@ def get_technical_chart_data(ticker="JPY=X"):
         high_5d = float(data['High'].tail(120).max())
         low_5d = float(data['Low'].tail(120).min())
         
+        # 直近10時間分のOHLC履歴を取得して文字列化（プライスアクション判定用）
+        recent_10 = data.tail(10)
+        history_str = "\n".join([f"[{idx.strftime('%m/%d %H:%M')}] Open:{row['Open']:.2f}, High:{row['High']:.2f}, Low:{row['Low']:.2f}, Close:{row['Close']:.2f}" for idx, row in recent_10.iterrows()])
+        
+        # --- NEW: MTFデータ (15m, 4h) ---
+        data_15m = yf.download(ticker, period="5d", interval="15m", progress=False)
+        if isinstance(data_15m.columns, pd.MultiIndex): data_15m.columns = [col[0] for col in data_15m.columns]
+        history_15m_str = "\n".join([f"[{idx.strftime('%m/%d %H:%M')}] Open:{row['Open']:.2f}, High:{row['High']:.2f}, Low:{row['Low']:.2f}, Close:{row['Close']:.2f}" for idx, row in data_15m.tail(10).iterrows()]) if not data_15m.empty else "N/A"
+
+        # yfinanceの制限を回避するため1h足を4h足にリサンプル
+        data_4h = data.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
+        history_4h_str = "\n".join([f"[{idx.strftime('%m/%d %H:%M')}] Open:{row['Open']:.2f}, High:{row['High']:.2f}, Low:{row['Low']:.2f}, Close:{row['Close']:.2f}" for idx, row in data_4h.tail(10).iterrows()]) if not data_4h.empty else "N/A"
+
         latest = data.iloc[-1]
         latest_tech = {
             "current": float(latest['Close']),
@@ -137,7 +150,10 @@ def get_technical_chart_data(ticker="JPY=X"):
             "is_squeeze": is_squeeze,
             "daily_sma20": float(daily_sma20),
             "high_5d": high_5d,
-            "low_5d": low_5d
+            "low_5d": low_5d,
+            "history_10h": history_str,
+            "history_15m": history_15m_str,
+            "history_4h": history_4h_str
         }
         return data, latest_tech
     except Exception as e:
@@ -171,6 +187,23 @@ def get_wall_street_news():
                 if len(news_list) >= 30: return news_list
         return news_list
     except: return [{"title": "ニュース取得エラー", "date": "--/--"}]
+
+def get_web_sentiment(news_list):
+    """(代替)WEBニュースから簡易的な買い・売りセンチメント（世論の偏り）を推計する。"""
+    bull_words = ["上昇", "高値", "買い", "強気", "利上げ", "タカ派", "上方修正"]
+    bear_words = ["下落", "安値", "売り", "弱気", "利下げ", "ハト派", "懸念", "警戒"]
+    bull_count = bear_words_count = 0
+    for news in news_list:
+        title = news["title"]
+        bull_count += sum(1 for w in bull_words if w in title)
+        bear_words_count += sum(1 for w in bear_words if w in title)
+    
+    total = bull_count + bear_words_count
+    if total == 0:
+        return {"bull_ratio": 50.0, "bear_ratio": 50.0, "status": "中立 (Neutral)"}
+    bull_ratio = (bull_count / total) * 100
+    status = "買い偏向 (Bullish)" if bull_ratio > 60 else "売り偏向 (Bearish)" if bull_ratio < 40 else "中立 (Neutral)"
+    return {"bull_ratio": bull_ratio, "bear_ratio": 100 - bull_ratio, "status": status}
 
 def check_economic_calendar(news_list):
     """ニュースから重要キーワードを検出し指標予定を抽出。"""
@@ -222,6 +255,11 @@ with col1:
     st.subheader("📅 重要経済指標予定")
     all_news = get_wall_street_news()
     calendar = check_economic_calendar(all_news)
+    sentiment = get_web_sentiment(all_news)
+    
+    st.metric("🌐 WEBセンチメント (ニュース解析)", f"{sentiment['bull_ratio']:.1f}% 買", sentiment['status'])
+    st.write("---")
+
     if calendar:
         for ev in calendar[:5]: st.warning(f"🕒 {ev['time']}\n{ev['title']}")
     else: st.success("本日の主要指標予定なし")
@@ -252,20 +290,63 @@ with col2:
             current_session = get_market_session()
             ai_context = f"""
             【市場セッション】{current_session}
-            【短期足(1H)】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI(14):{tech['rsi14']:.1f}
-            【ボラティリティ】BB幅:{tech['bb_width']:.4f}, 平均幅:{tech['bb_avg_width']:.4f}, 状態:{'スクイーズ' if tech['is_squeeze'] else 'エクスパンション'}
-            【長期足(日足)】日足SMA20:{tech['daily_sma20']:.3f}, 5日高値:{tech['high_5d']:.3f}, 5日安値:{tech['low_5d']:.3f}
-            【外部環境】米10年債:{m['TNX']['val']:.2f}%, ドル指数:{m['DXY']['val']:.2f}, 日経平均:{m['N225']['val']:,.0f}, SP500:{m['SPX']['val']:,.0f}, VIX:{m['VIX']['val']:.2f}
-            """
-            prompt = f"以下の【市場データ】と【ニュース】を元に、RSIの過熱感、BBのスクイーズ、上位足トレンドを考慮した最強の戦略を立て、具体的な価格を出してください。\n\n{ai_context}\n\n【ニュース】\n{news_text}"
+            【WEBセンチメント(独自のニュース解析ベース)】{sentiment['status']} (買比率: {sentiment['bull_ratio']:.1f}%)
             
+            【プライスアクション・フラクタル構造(MTF)】
+            [15分足 (直近10本: エントリータイミング用)]
+            {tech.get('history_15m', '')}
+            
+            [1時間足 (直近10本: メイントレンド用)]
+            {tech.get('history_10h', '')}
+            
+            [4時間足 (直近10本: 大局の環境認識用)]
+            {tech.get('history_4h', '')}
+            
+            【短期足(1H) テクニカル詳細】現在:{usd_p:.3f}, SMA20:{tech['sma20']:.3f}, SMA50:{tech['sma50']:.3f}, BB上2σ:{tech['upper2']:.3f}, BB下2σ:{tech['lower2']:.3f}, RSI(14):{tech['rsi14']:.1f}
+            【ボラティリティ】BB幅:{tech['bb_width']:.4f}, 平均幅:{tech['bb_avg_width']:.4f}, 状態:{'スクイーズ' if tech['is_squeeze'] else 'エクスパンション'}
+            【長期足(日足) トレンド】日足SMA20:{tech['daily_sma20']:.3f}, 5日高値:{tech['high_5d']:.3f}, 5日安値:{tech['low_5d']:.3f}
+            【外部環境・マクロ】米10年債:{m['TNX']['val']:.2f}%, ドル指数:{m['DXY']['val']:.2f}, 日経平均:{m['N225']['val']:,.0f}, SP500:{m['SPX']['val']:,.0f}, VIX:{m['VIX']['val']:.2f}
+            """
+            
+            prompt = f"""あなたは世界最高峰のFXプロトレーダーです。ダウ理論・エリオット波動・プライスアクション（ローソク足の形状やヒゲ）を考慮し、論理的かつ厳格なトレード戦略を立ててください。
+以下の【市場データ】と【ニュース】を元に、現在の相場環境を分析し、最適なエントリーポイント、利益確定(TP)、損切り(SL)を決定します。
+【厳守ルール】
+・リスクリワード比率は1:1.5以上を確保すること。
+・理由のないブレイクアウト狙いは避け、レジサポでの反発（押し目買い・戻り売り）を基本とすること。
+・具体的な戦略の根拠を明確に解説すること。
+
+{ai_context}
+
+【ニュース】
+{news_text}
+"""
+            
+            # 戦略テキストの生成
             response = model.generate_content(prompt)
             st.session_state.strategy_result = response.text
             
-            json_prompt = f"現在の価格{usd_p}円を基準に、以下から {{'side': 'buy'or'sell', 'entry': 数値, 'tp': 数値, 'sl': 数値}} のJSONのみ出力せよ。\n\n{st.session_state.strategy_result}"
-            json_res = model.generate_content(json_prompt).text
-            match = re.search(r'\{.*\}', json_res, re.DOTALL)
-            if match: st.session_state.target_prices = json.loads(match.group())
+            # JSON抽出プロンプト (Structured Output使用)
+            json_prompt = f"""以下の分析結果をもとに、具体的なトレード条件をJSONフォーマットのみで抽出してください。
+価格は現在の {usd_p} 円を基準に論理的に計算してください。
+出力フォーマット:
+{{
+    "side": "buy" または "sell",
+    "entry": 数値 (例: 150.25),
+    "tp": 数値 (例: 151.00),
+    "sl": 数値 (例: 149.50)
+}}
+
+分析結果:
+{st.session_state.strategy_result}
+"""
+            try:
+                json_res = model.generate_content(
+                    json_prompt,
+                    generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
+                )
+                st.session_state.target_prices = json.loads(json_res.text)
+            except Exception as e:
+                st.error(f"JSON解析エラーが発生しました。AIの出力を確認してください。詳細: {e}")
 
 # --- 右カラム：戦略 ＆ 資金管理 ---
 with col3:
