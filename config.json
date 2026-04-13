@@ -5,7 +5,7 @@
   "tp": 159.82,
   "sl": 159.6,
   "lots": 6.67,
-  "status": "holding",
-  "is_active": true,
+  "status": "done",
+  "is_active": false,
   "trail_active": true
 }
