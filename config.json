@@ -5,6 +5,6 @@
   "tp": 159.15,
   "sl": 159.6,
   "lots": 5.56,
-  "status": "waiting_entry",
+  "status": "holding",
   "is_active": true
 }
