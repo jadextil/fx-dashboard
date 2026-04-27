@@ -3,8 +3,9 @@
   "side": "sell",
   "entry": 159.42,
   "tp": 159.15,
-  "sl": 159.6,
+  "sl": 159.42,
   "lots": 5.56,
   "status": "holding",
-  "is_active": true
+  "is_active": true,
+  "trail_active": true
 }
